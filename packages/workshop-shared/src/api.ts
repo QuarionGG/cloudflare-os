@@ -1163,6 +1163,11 @@ export type AdminSettingsView = {
   accentColor: string;
   /** The hosts `webFetch` may reach in a workspace that has observed restricted data. */
   restrictedWebFetchHosts: string[];
+  /**
+   * Whether a user may approve, one URL at a time, a fetch that `restrictedWebFetchHosts` doesn't
+   * allow, in a workspace that has observed restricted data.
+   */
+  restrictedWebFetchApprovals: boolean;
   /** Every bound gatekeeper and its resource types, with enabled state (not hidden when disabled). */
   resourceVendors: AdminResourceVendor[];
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
@@ -1345,6 +1350,9 @@ export interface AdminApi {
    * host name, such as one with a scheme, port, path or wildcard. Resolves to the list as stored.
    */
   setRestrictedWebFetchHosts(hosts: string[]): Promise<string[]>;
+
+  /** Set `AdminSettingsView.restrictedWebFetchApprovals`. */
+  setRestrictedWebFetchApprovals(enabled: boolean): Promise<void>;
 
   /**
    * Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.
@@ -2302,8 +2310,8 @@ export type WorkspaceMetadata = {
    * True when the workspace has observed data marked `containsRestrictedData` (see
    * `ObservationDescription`). It can still be shared, with collaborators verified per
    * gatekeeper (if `ownerInvitesOnly` is also set, only the owner can add them), but its web
-   * fetches reach only the hosts the deployment admin trusts (none by default), and every action
-   * requires manual approval.
+   * fetches reach only the hosts the deployment admin trusts (none by default) or, where the admin
+   * allows it, a URL a user approves, and every action requires manual approval.
    */
   containsRestrictedData?: boolean;
 
@@ -3018,6 +3026,16 @@ export interface Overseer extends RpcTarget {
    * the turn stays ended so the user can decide what to tell the agent to do instead.
    */
   denyConnectionRequest(requestId: string): Promise<void>;
+
+  /**
+   * Approve an agent's pending request to fetch a URL (a "webFetchRequest" chat message) that the
+   * workspace's restricted mode refuses. Updates the inline card and resumes the agent, which may
+   * then fetch that URL, and follow its redirects, until the user's next prompt.
+   */
+  approveWebFetchRequest(requestId: string): Promise<void>;
+
+  /** Deny an agent's pending request to fetch a URL. Like denyConnectionRequest, the turn stays ended. */
+  denyWebFetchRequest(requestId: string): Promise<void>;
 
   /**
    * Subscribe to action adds/updates. Dispose the returned stub to unsubscribe.
@@ -4245,6 +4263,22 @@ export type AiChatMessageBody = {
    * turn-start naming chokepoint.
    */
   bindingName?: string;
+} | {
+  /**
+   * The agent asked to fetch a URL that the workspace's restricted mode refuses (see
+   * `AdminSettingsView.restrictedWebFetchApprovals`). Rendered as an approve/deny card, and mutated
+   * in place when the user decides, who vouches that the URL holds no restricted data.
+   */
+  type: "webFetchRequest";
+
+  /** Unique id used by approveWebFetchRequest()/denyWebFetchRequest(). */
+  requestId: string;
+
+  /** The URL, exactly as it will be requested. */
+  url: string;
+
+  /** Starts "pending"; set by the user's decision. */
+  state: "pending" | "approved" | "denied";
 };
 
 /**
