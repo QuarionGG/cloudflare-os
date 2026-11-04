@@ -1069,6 +1069,11 @@ type PendingActionRow = {
   autoApprovable?: boolean;
   /** Set when the overseer first applies it, which proves it received the action (see submitWrite). */
   applyStarted?: true;
+  /**
+   * The revert target captured before the first apply attempt. A retry reuses it, because an
+   * attempt whose reply was lost may already have changed what a fresh snapshot would read.
+   */
+  revertInfo?: HomeAssistantRevertInfo;
 };
 
 // Internal storage row for actions that have been applied. Retained so that revertAction() can
@@ -1202,12 +1207,15 @@ export class HomeAssistantGatekeeperImpl
     const action = pending.action;
     if (!pending.applyStarted) this.ctx.storage.kv.put<PendingActionRow>(`pending:${actionId}`, { ...pending, applyStarted: true });
     const creds = await this.#getCreds();
-    let revertInfo: HomeAssistantRevertInfo;
-    try {
-      revertInfo = await this.#snapshotForRevert(action, creds);
-    } catch {
-      // If we can't snapshot, proceed without revert.
-      revertInfo = { type: "noRevert" };
+    // The revert target is the state before the first attempt, stored before anything runs so a
+    // retry after a lost reply cannot snapshot the changed state; a failed snapshot stays
+    // `noRevert` for the same reason. If the auto-approval drainer stopped re-applying an action
+    // whose automatic apply was attempted, the kernel would cover this for every gatekeeper.
+    let revertInfo = pending.revertInfo;
+    if (!revertInfo) {
+      revertInfo = await this.#snapshotForRevert(action, creds)
+        .catch((): HomeAssistantRevertInfo => ({ type: "noRevert" }));
+      this.ctx.storage.kv.put<PendingActionRow>(`pending:${actionId}`, { ...pending, applyStarted: true, revertInfo });
     }
 
     // Home Assistant resolves area, device, label and floor targets when the call runs, so what a

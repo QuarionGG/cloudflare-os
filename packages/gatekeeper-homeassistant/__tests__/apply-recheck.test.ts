@@ -18,7 +18,13 @@ for (const name of ["instance", "area", "label", "device", "entity"]) {
 }
 vi.mock("../src/types.txt", () => ({ default: "" }));
 
-const live = vi.hoisted(() => ({ registry: undefined as unknown as RegistrySnapshot, failCalls: false }));
+const live = vi.hoisted(() => ({
+  registry: undefined as unknown as RegistrySnapshot,
+  failCalls: false,
+  revertible: false,
+  // Commits the call by turning the plug on, then loses the reply.
+  loseReply: false,
+}));
 vi.mock("../src/homeassistant-api", async importOriginal => ({
   ...await importOriginal<typeof import("../src/homeassistant-api")>(),
   fetchRegistrySnapshot: async () => live.registry,
@@ -29,8 +35,10 @@ vi.mock("../src/approvals", async importOriginal => ({
   executeAction: async (action: unknown) => {
     if (live.failCalls) throw new Error("Home Assistant is unavailable");
     executed.push(action);
+    live.registry.states.set("switch.plug", { entity_id: "switch.plug", state: "on", attributes: {} } as never);
+    if (live.loseReply) throw new Error("Network connection lost.");
   },
-  canRevert: () => false,
+  canRevert: () => live.revertible,
 }));
 
 const { HomeAssistantGatekeeperImpl } = await import("../src/homeassistant");
@@ -69,7 +77,11 @@ function queue(onSubmit: (id: number, description: { autoApprovable: boolean }) 
 
 const turnOnLounge = { domain: "switch", service: "turn_on", target: { areaId: "lounge" } };
 
-beforeEach(() => { executed.length = 0; });
+beforeEach(() => {
+  executed.length = 0;
+  live.revertible = false;
+  live.loseReply = false;
+});
 
 describe("applying a queued device-control call", () => {
   it("is refused when a script-backed entity joined its area after it was queued", async () => {
@@ -145,5 +157,57 @@ describe("submitting a call that is applied before the reply arrives", () => {
     const session = await gk.startSession(queue(async () => { throw new Error("queue gone"); })) as any;
     await expect(session.callService(turnOnLounge.domain, turnOnLounge.service, undefined, turnOnLounge.target)).rejects.toThrow("queue gone");
     expect([...kv.keys()].filter(key => key.startsWith("pending:"))).toEqual([]);
+  });
+});
+
+describe("the revert target of an applied call", () => {
+  function offPlug(): RegistrySnapshot {
+    const registry = home();
+    registry.states.set("switch.plug", { entity_id: "switch.plug", state: "off", attributes: {} } as never);
+    return registry;
+  }
+  const previousOf = (kv: Map<string, unknown>, id: number) =>
+    (kv.get(`applied:${id}`) as { revertInfo: { previous: Array<{ state: string }> } }).revertInfo.previous;
+
+  it("is the state before the call", async () => {
+    const { gk, kv } = gatekeeper();
+    live.registry = offPlug();
+    live.revertible = true;
+    let id = 0;
+    const session = await gk.startSession(queue(async submitted => { id = submitted; })) as any;
+    await session.callService(turnOnLounge.domain, turnOnLounge.service, undefined, turnOnLounge.target);
+    await gk.applyAction(id);
+    expect(previousOf(kv, id)).toEqual([{ entityId: "switch.plug", state: "off", attributes: {} }]);
+  });
+
+  it("stays the original state when a retry follows an attempt that committed but lost its reply", async () => {
+    const { gk, kv } = gatekeeper();
+    live.registry = offPlug();
+    live.revertible = true;
+    let id = 0;
+    const session = await gk.startSession(queue(async submitted => { id = submitted; })) as any;
+    await session.callService(turnOnLounge.domain, turnOnLounge.service, undefined, turnOnLounge.target);
+    live.loseReply = true;
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    expect(live.registry.states.get("switch.plug")?.state).toBe("on");
+    live.loseReply = false;
+    await gk.applyAction(id);
+    expect(executed).toHaveLength(2);
+    expect(previousOf(kv, id)).toEqual([{ entityId: "switch.plug", state: "off", attributes: {} }]);
+  });
+
+  it("stays unrevertable when the first snapshot failed", async () => {
+    const { gk, kv } = gatekeeper();
+    live.registry = offPlug();
+    let id = 0;
+    const session = await gk.startSession(queue(async submitted => { id = submitted; })) as any;
+    await session.callService(turnOnLounge.domain, turnOnLounge.service, undefined, turnOnLounge.target);
+    live.revertible = true;
+    const registry = live.registry;
+    live.registry = undefined as never;
+    await expect(gk.applyAction(id)).rejects.toThrow();
+    live.registry = registry;
+    await gk.applyAction(id);
+    expect((kv.get(`applied:${id}`) as { revertInfo: unknown }).revertInfo).toEqual({ type: "noRevert" });
   });
 });
