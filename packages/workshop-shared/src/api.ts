@@ -2668,9 +2668,10 @@ export interface Overseer extends RpcTarget {
   /**
    * Create a new gatekeeper for an AI model binding. The model can be any returned by
    * `AuthenticatedApi.listModels()`. A language model's gatekeeper provides a
-   * `LanguageModelBinding`, a decision model's a `DecisionModelBinding`.
+   * `LanguageModelBinding`, a decision model's a `DecisionModelBinding`. With purpose `ocr`,
+   * a language model provides an `OcrModelBinding` requiring image input instead.
    */
-  newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>>;
+  newAiModelGatekeeper(modelId: string, purpose?: "ocr"): Promise<GatekeeperClient<any>>;
 
   /**
    * Create a new gatekeeper for an agent spawner binding. This allows the gadget to
@@ -5014,6 +5015,8 @@ export type GatekeeperCreationSpec = {
   modelId: string;         // the user's configured model ID
   provider: string;        // provider name (e.g. "anthropic")
   modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
+  /** An image-only OCR connection; absent for ordinary model bindings. */
+  purpose?: "ocr";
 } | {
   type: "agentSpawner";
   config: AgentSpawnerConfig;
@@ -5122,6 +5125,8 @@ export type BlueprintBinding = {
 
   /** The source binding's model kind, so installers pick one of that kind; absent: `"language"`. */
   modelKind?: ModelKind;
+  /** Preserve the dedicated image-reading surface when installing this blueprint. */
+  purpose?: "ocr";
 } | {
   /** An agent spawner binding. */
   type: "agentSpawner";

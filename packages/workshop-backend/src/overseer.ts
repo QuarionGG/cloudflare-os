@@ -8167,6 +8167,7 @@ class OverseerImpl implements AgentHooks {
         bindings[bindingName] = {
           ...base,
           type: "aiModel",
+          ...(spec.purpose ? {purpose: spec.purpose} : {}),
           ...(suggestValue
             ? {suggestedModel: {provider: spec.provider, modelName: spec.modelName}}
             : {}),
@@ -8228,6 +8229,7 @@ class OverseerImpl implements AgentHooks {
               : {
                   ...synthBase,
                   type: "aiModel",
+                  ...(targetSpec.purpose ? {purpose: targetSpec.purpose} : {}),
                   ...(modelKind(targetSpec.provider, targetSpec.modelName) === "decision"
                       ? {modelKind: "decision"} : {}),
                 };
@@ -11349,7 +11351,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return result;
   }
 
-  async newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>> {
+  async newAiModelGatekeeper(modelId: string, purpose?: "ocr"): Promise<GatekeeperClient<any>> {
     let chatMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(modelId), this.impl.logger);
     let props: AiModelGatekeeperProps = {
@@ -11357,6 +11359,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
+      ...(purpose ? {purpose} : {}),
+    }
+
+    if (purpose && (modelKind(props.config.provider, props.config.model) === "decision" ||
+        !getModel(this.impl.env, props.config, props.initiator).model.input.includes("image"))) {
+      throw new Error("OCR requires a language model with image input.");
     }
 
     let creationSpec: GatekeeperCreationSpec = {
@@ -11364,6 +11372,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       modelId,
       provider: chatMeta.aiModel!.config.provider,
       modelName: chatMeta.aiModel!.config.model,
+      ...(purpose ? {purpose} : {}),
     };
 
     let result = await this.impl.addGatekeeper(

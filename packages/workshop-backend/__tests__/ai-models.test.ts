@@ -11,6 +11,7 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
 import { zeroUsage } from "../src/ai-invoke.js";
+import type { OcrModelBinding } from "../src/ai-model-binding.js";
 import {
   DecisionModelGatekeeper, gatewayBuiltInReasoning, gatewayReasoningLevels, getDecisionModel,
   getModel, isRuntimeModel, LanguageModelGatekeeper, type ModelHandle,
@@ -1414,16 +1415,16 @@ describe("LanguageModelGatekeeper.startSession", () => {
 
   // The session of a binding minted for `config`, on a deployment whose admin config is `admin`.
   function startSession(config: AiModelConfig, admin: Partial<AdminConfig>,
-                        overrides: Partial<Cloudflare.Env> = {}) {
+                        overrides: Partial<Cloudflare.Env> = {}, purpose?: "ocr") {
     const getConfig = vi.fn(
         async () => serializeAdminConfig({ ...DEFAULT_ADMIN_CONFIG, ...admin }));
     const gatekeeper = Object.create(LanguageModelGatekeeper.prototype) as LanguageModelGatekeeper;
     Object.assign(gatekeeper, {
       env: env({ BLUEPRINTS: { get: getConfig } as unknown as KVNamespace, ...overrides }),
-      ctx: { props: { displayName: "Model", config, initiator: GADGET_INITIATOR } },
+      ctx: { props: { displayName: "Model", config, initiator: GADGET_INITIATOR, purpose } },
     });
     // The binding implements no actions, so a session never touches its approval queue.
-    return { session: gatekeeper.startSession(undefined as never), getConfig };
+    return { session: gatekeeper.startSession(undefined as never), getConfig, gatekeeper };
   }
 
   it("refuses a gateway model the admin disabled", async () => {
@@ -1468,6 +1469,97 @@ describe("LanguageModelGatekeeper.startSession", () => {
         { ...DISABLED, userModelsEnabled: false }, { CF_AI_GATEWAY: undefined });
     expect((await session).run).toBeTypeOf("function");
     expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  const png = {
+    mimeType: "image/png" as const,
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=",
+  };
+
+  it.each(["gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol"])(
+      "forwards an image through the actual model binding and provider for %s", async model => {
+    capturedRequests.length = 0;
+    const binding = await startSession({provider: "openai", model, apiToken: "adapter-token"},
+        {}, {CF_AI_GATEWAY: undefined}).session;
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      await expect(binding.run({prompt: "Read the image", images: [png]})).rejects.toThrow("stubbed");
+      const request = JSON.parse(capturedRequests[0].body);
+      expect(request.model).toBe(model);
+      expect(request.input.find((item: {role: string}) => item.role === "user").content).toEqual([
+        {type: "input_text", text: "Read the image"},
+        {type: "input_image", detail: "auto", image_url: `data:image/png;base64,${png.data}`},
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    {name: "a URL", images: [{...png, data: "https://example.com/image.png"}]},
+    {name: "a data URL", images: [{...png, data: `data:image/png;base64,${png.data}`}]},
+    {name: "mislabeled bytes", images: [{...png, data: btoa("not an image")}]},
+    {name: "a truncated header", images: [{...png, data: "iVBORw=="}]},
+    {name: "six images", images: Array.from({length: 6}, () => png)},
+    {name: "oversized Base64", images: [{...png, data: "A".repeat(6 * 1024 * 1024)}]},
+  ])("rejects $name before contacting the provider", async ({images}) => {
+    const binding = await startSession(
+        {provider: "openai", model: "gpt-6.1-terra", apiToken: "adapter-token"},
+        {}, {CF_AI_GATEWAY: undefined}).session;
+    const fetch = vi.fn(fetchStub);
+    vi.stubGlobal("fetch", fetch);
+    try {
+      await expect(binding.run({prompt: "Read", images})).rejects.toThrow();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("advertises a dedicated OCR capability and defaults to transcription with the same model", async () => {
+    const {session, gatekeeper} = startSession(
+        {provider: "openai", model: "gpt-6.1-terra", apiToken: "adapter-token"},
+        {}, {CF_AI_GATEWAY: undefined}, "ocr");
+    expect(await gatekeeper.describe()).toMatchObject({
+      tsType: "OcrModelBinding", suggestedBindingName: "OCR",
+    });
+    expect(await gatekeeper.getTypeScriptTypes()).toContain("readImages(options:");
+    const binding = await session;
+    // Runtime session additionally implements the advertised OCR contract.
+    const ocr = binding as typeof binding & OcrModelBinding;
+    capturedRequests.length = 0;
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      await expect(ocr.readImages({images: [png]})).rejects.toThrow("stubbed");
+      const request = JSON.parse(capturedRequests[0].body);
+      expect(request.model).toBe("gpt-6.1-terra");
+      expect(request.input.find((item: {role: string}) => item.role === "user").content[0].text)
+          .toContain("Transcribe all visible text");
+      capturedRequests.length = 0;
+      await expect(ocr.readImages({images: []})).rejects.toThrow("at least one image");
+      await expect(binding.run({prompt: "Text only"})).rejects.toThrow("at least one image");
+      expect(capturedRequests).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("bounds the total decoded image bytes before contacting the provider", async () => {
+    const bytes = new Uint8Array(3 * 1024 * 1024);
+    bytes.set(Uint8Array.fromBase64(png.data));
+    const image = {...png, data: bytes.toBase64()};
+    const binding = await startSession(
+        {provider: "openai", model: "gpt-6.1-terra", apiToken: "adapter-token"},
+        {}, {CF_AI_GATEWAY: undefined}).session;
+    const fetch = vi.fn(fetchStub);
+    vi.stubGlobal("fetch", fetch);
+    try {
+      await expect(binding.run({prompt: "Read", images: [image, image]}))
+          .rejects.toThrow("5 MiB total");
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   describe("where users' own models are concerned", () => {

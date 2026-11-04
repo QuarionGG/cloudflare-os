@@ -3,7 +3,7 @@ import { validateRpc } from "capnweb-validate";
 import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, ClassifierApi, ClassifierContext,
   ClassifierModel, ClassifierOptions, ClassifierResult, Context, FetchFunction, Model, ModelCost,
-  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
+  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction, UserMessage,
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, normalizeContext }
   from "@earendil-works/pi-ai";
@@ -23,7 +23,7 @@ import {
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
-import { LanguageModelBinding } from "./ai-model-binding";
+import { LanguageModelBinding, OcrModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decision-model-binding";
 import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
@@ -36,6 +36,9 @@ import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
+import {
+  canInlineChatAttachmentImage, validateChatAttachmentUpload,
+} from "./chat-attachment-validation.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import { hasGpt56PromptCaching, splitSystemPrompt } from "./system-prompt-blocks.js";
 
@@ -964,6 +967,8 @@ export type AiModelGatekeeperProps = {
   config: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
+  /** Require image input and advertise the dedicated OCR binding. */
+  purpose?: "ocr",
 };
 
 /**
@@ -993,11 +998,12 @@ export class LanguageModelGatekeeper
       url: `http://models.local/${modelConfig.provider}/${modelConfig.model}`,
 
       title: displayName,
-      snippet: "An AI large language model.",
+      snippet: this.ctx.props.purpose === "ocr"
+          ? "Read images and transcribe text with this model." : "An AI large language model.",
 
-      suggestedBindingName: "LLM",
+      suggestedBindingName: this.ctx.props.purpose === "ocr" ? "OCR" : "LLM",
 
-      tsType: "LanguageModelBinding",
+      tsType: this.ctx.props.purpose === "ocr" ? "OcrModelBinding" : "LanguageModelBinding",
     };
   }
 
@@ -1018,7 +1024,10 @@ export class LanguageModelGatekeeper
     let model = getModel(this.env, config, this.ctx.props.initiator, {
       metadata: this.ctx.props.metadata,
     });
-    return new LanguageModelBindingImpl(model);
+    if (this.ctx.props.purpose === "ocr" && !model.model.input.includes("image")) {
+      throw new Error("This model does not support image input.");
+    }
+    return new LanguageModelBindingImpl(model, this.ctx.props.purpose === "ocr");
   }
 
   applyAction(action: number): Promise<void> {
@@ -1044,19 +1053,54 @@ export class LanguageModelGatekeeper
 
 @validateRpc()
 class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
-  constructor(private model: ModelHandle) {
+  constructor(private model: ModelHandle, private ocrOnly = false) {
     super();
   }
 
-  async run(options: {prompt: string, systemPrompt?: string}): Promise<string> {
+  async run(options: Parameters<LanguageModelBinding["run"]>[0]): Promise<string> {
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
     // TODO: Account LLM costs back to the calling gadget.
     // A gadget may call its binding many times with the same system prompt.
+    const images = options.images ?? [];
+    if (this.ocrOnly && !images.length) throw new Error("OCR requires at least one image.");
+    if (images.length > 5) throw new Error("At most five images are supported.");
+    if (images.length && !this.model.model.input.includes("image")) {
+      throw new Error("This model does not support image input.");
+    }
+    let totalBytes = 0;
+    const content: UserMessage["content"] = [
+      {type: "text", text: options.prompt},
+    ];
+    for (const image of images) {
+      if (image.data.length > 4 * Math.ceil(4 * 1024 * 1024 / 3)) {
+        throw new Error("Image exceeds 4 MiB.");
+      }
+      // fromBase64 checks the encoding; require canonical padded Base64 so a URL or trailing
+      // payload cannot be silently accepted as image bytes.
+      const bytes = Uint8Array.fromBase64(image.data, {lastChunkHandling: "strict"});
+      if (bytes.toBase64() !== image.data) throw new Error("Image must use canonical Base64.");
+      validateChatAttachmentUpload({mimeType: image.mimeType, content: bytes});
+      if (!canInlineChatAttachmentImage(image.mimeType, bytes)) {
+        throw new Error("Image header or dimensions are unsupported.");
+      }
+      totalBytes += bytes.byteLength;
+      if (totalBytes > 5 * 1024 * 1024) throw new Error("Images exceed 5 MiB total.");
+      content.push({type: "image", mimeType: image.mimeType, data: image.data});
+    }
     return await completeText(this.model, {
-      prompt: options.prompt,
+      messages: [{role: "user", content, timestamp: Date.now()}],
       systemPrompt: options.systemPrompt,
       cache: true,
+    });
+  }
+
+  async readImages(options: Parameters<OcrModelBinding["readImages"]>[0]): Promise<string> {
+    if (!options.images.length) throw new Error("OCR requires at least one image.");
+    return this.run({
+      ...options,
+      prompt: options.prompt ?? "Transcribe all visible text in the images verbatim. " +
+          "Preserve line breaks, accents, digits and punctuation. Do not invent unreadable text.",
     });
   }
 }
