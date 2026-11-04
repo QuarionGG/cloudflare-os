@@ -306,6 +306,25 @@ describe("Google Calendar auto-approval", () => {
     expect(calendar.events.size).toBe(1);
   });
 
+  it("reverts to what a collaborator left when the first update was refused by their edit", async () => {
+    let calendar = new CalendarModel();
+    calendar.add("own", { summary: "Original" });
+    calendar.install();
+    let call = await hooks().updateEvent("refused-first", "own", { title: "Deep work" });
+    expect(call.action).toMatchObject({ autoApprovable: true });
+    calendar.afterRead = () => {
+      calendar.afterRead = undefined;
+      calendar.edit("own", { summary: "Collaborator change" });
+    };
+
+    expect(await hooks().applyAction("refused-first", call.actionId!)).toMatch(/Nothing was changed/);
+    expect(await hooks().applyAction("refused-first", call.actionId!)).toBeNull();
+    expect(calendar.events.get("own")!.summary).toBe("Deep work");
+
+    expect(await hooks().revertAction("refused-first", call.actionId!)).toBeNull();
+    expect(calendar.events.get("own")!.summary).toBe("Collaborator change");
+  });
+
   it("reverts to the original after an update applied again once its reply was lost", async () => {
     let calendar = new CalendarModel();
     calendar.add("meeting", { summary: "Original", attendees: [{ email: "guest@example.com" }] });

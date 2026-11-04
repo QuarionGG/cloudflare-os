@@ -2902,6 +2902,9 @@ export class GoogleCalendarGatekeeperImpl
             (!oldEvent.etag || !updateEventVerdict(oldEvent, action.patch).autoApprovable)) {
           throw changedError;
         }
+        // A stored undo patch means an earlier attempt was sent and may have landed, so it is kept;
+        // a refusal of the first attempt proves nothing landed, and the next read decides afresh.
+        let earlier = action.previous !== undefined;
         let previous = action.previous ?? priorCalendarPatch(oldEvent, action.patch);
         pendingActions.put(actionId, {...action, previous});
         try {
@@ -2912,6 +2915,9 @@ export class GoogleCalendarGatekeeperImpl
             eventPatchToGoogle(action.patch), action.sendUpdates,
             action.autoApprovable ? oldEvent.etag : undefined);
         } catch (error) {
+          if (!earlier && error instanceof GoogleCalendarApiError && error.status < 500) {
+            pendingActions.put(actionId, action);
+          }
           if (error instanceof GoogleCalendarApiError && error.status === 412) throw changedError;
           throw error;
         }
