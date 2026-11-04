@@ -67,6 +67,29 @@ function makeApi(contentType: "page" | "blogpost" = "page", status: string = "cu
   return { api, calls };
 }
 
+// A page whose updates land as the next version, and whose next update's reply can be lost
+// after (`landed`) or before it lands.
+function pageLosingAReply(landed: boolean) {
+  const { api } = makeApi();
+  const page = { version: 3, body: "<p>body</p>" };
+  let loseReply = true;
+  api.getContentById = (async (id: string) => ({
+    id, type: "page", status: "current", title: "Title",
+    version: { number: page.version }, body: { storage: { value: page.body } },
+  })) as never;
+  api.updateContent = (async (b: { version: number; storageValue: string }) => {
+    if (loseReply) {
+      loseReply = false;
+      if (landed) Object.assign(page, { version: b.version, body: b.storageValue });
+      throw new Error("Network connection lost.");
+    }
+    if (b.version !== page.version + 1) throw new Error("Version conflict.");
+    Object.assign(page, { version: b.version, body: b.storageValue });
+    return {};
+  }) as never;
+  return { api, page };
+}
+
 function storeWith(api: ConfluenceApi) {
   return new ConfluenceStore(makeStorage(), api);
 }
@@ -181,6 +204,32 @@ describe("applyStoredAction", () => {
     await applyStoredAction(store, id);
 
     expect(calls.uploadAttachment).toEqual([{ id: "123", filename: "legacy.bin", data }]);
+    expect(store.getAction(id)?.state).toBe("applied");
+  });
+
+  it("won't append again after an append whose reply was lost moved the page on", async () => {
+    const { api, page } = pageLosingAReply(true);
+    const store = storeWith(api);
+    const id = stage(store, { type: "appendContent", contentId: "123", markdown: "more" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+    expect(page.version).toBe(4);
+    expect(page.body.match(/more/g)).toHaveLength(1);
+    expect(store.getAction(id)?.state).toBe("pending");
+  });
+
+  it("appends on a retry when the failed attempt left the page as it was", async () => {
+    const { api, page } = pageLosingAReply(false);
+    const store = storeWith(api);
+    const id = stage(store, { type: "appendContent", contentId: "123", markdown: "more" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await applyStoredAction(store, id);
+
+    expect(page.version).toBe(4);
+    expect(page.body.match(/more/g)).toHaveLength(1);
     expect(store.getAction(id)?.state).toBe("applied");
   });
 });

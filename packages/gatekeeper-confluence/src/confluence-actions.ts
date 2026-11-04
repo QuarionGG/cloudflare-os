@@ -77,6 +77,11 @@ export type StoredActionRecord = {
    * reply was lost (see stageAction).
    */
   applyStartedAt?: number;
+  /**
+   * For appendContent: the version of the page the append was built on, recorded before the write
+   * so a retry can tell whether the page has moved on since (see applyAction).
+   */
+  appendBaseVersion?: number;
   /** For createContent / addComment: the real content ID assigned on apply. */
   createdContentId?: string;
   /** For uploadAttachment: the attachment ID assigned on apply. */
@@ -619,12 +624,24 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     case "appendContent": {
       const id = requireResolved(store, action.contentId);
       const current = await store.getContentResponse(id, true);
+      const version = current.version?.number ?? 1;
+      // Confluence takes an update only as the next version, so a page that has moved past the
+      // version an earlier attempt was built on may hold that attempt's append, its reply lost.
+      // Nothing says whose edit moved it, and appending again could add the text twice.
+      if (record.appendBaseVersion !== undefined && record.appendBaseVersion !== version) {
+        throw new Error(
+          `Content ${action.contentId} changed after an earlier attempt to append to it, which may have ` +
+          `gone through, so it won't be appended again. Check the page and discard this action; if the ` +
+          `text is missing, ask for it again.`);
+      }
+      record.appendBaseVersion = version;
+      store.putAction(record);
       const combined = (current.body?.storage?.value ?? "") + markdownToStorage(action.markdown);
       await api.updateContent({
         id,
         type: current.type === "blogpost" ? "blogpost" : "page",
         title: current.title,
-        version: (current.version?.number ?? 1) + 1,
+        version: version + 1,
         storageValue: combined,
         status: preservedStatus(current),
       });
