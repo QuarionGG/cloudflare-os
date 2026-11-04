@@ -207,6 +207,7 @@ export default function GatekeeperModal({
   const [availableModels, setAvailableModels] = useState<AiChatAuthorInfo[]>([])
   const [decisionModels, setDecisionModels] = useState<AiChatAuthorInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string | undefined>()
+  const [modelPurpose, setModelPurpose] = useState<'ocr' | undefined>()
 
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null)
   const [configuratorFrameState, setConfiguratorFrameState] = useState<ConfiguratorFrameState | null>(null)
@@ -374,6 +375,7 @@ export default function GatekeeperModal({
     setConfiguratorError(null)
     setConfiguratorSelectionReady(null)
     setSelectedModelId(undefined)
+    setModelPurpose(undefined)
     setSpawnerDisplayName('')
     setSpawnerModelId(null)
     setSpawnerEnv(
@@ -677,7 +679,8 @@ export default function GatekeeperModal({
     let transferred = false
     try {
       const overseer = await getOverseer()
-      gatekeeper = await overseer.newAiModelGatekeeper(selectedModelId)
+      gatekeeper = await overseer.newAiModelGatekeeper(selectedModelId,
+        availableModels.some(model => model.id === selectedModelId) ? modelPurpose : undefined)
       if (gatekeeper) {
         await onCreated(gatekeeper)
         transferred = true
@@ -887,6 +890,8 @@ export default function GatekeeperModal({
                     decisionModels={decisionModels}
                     selectedModelId={selectedModelId}
                     onSelectedModelIdChange={setSelectedModelId}
+                    purpose={modelPurpose}
+                    onPurposeChange={setModelPurpose}
                     selectContainer={selectPortalContainer}
                   />
                 )}

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import type {
   AiChatAuthorInfo, AuthenticatedApi, ConnectedAccountsSubscriber, ConnectFlowStart, ModelKind,
+  Overseer,
 } from '@gadgets/workshop-shared/api'
 import type { SupportedResource } from '@gadgets/workshop-shared/gatekeeper'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
@@ -77,7 +78,7 @@ vi.mock('./ResourceConfiguratorHost', async () => {
   return { default: ResourceConfiguratorHost }
 })
 
-import GatekeeperModal from './GatekeeperModal'
+import GatekeeperModal, { type GatekeeperModalProps } from './GatekeeperModal'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -167,6 +168,7 @@ async function renderModal(props: {
   initialVendorId?: string
   initialResourceUrlPattern?: string
   initialAccountId?: number
+  getOverseer?: GatekeeperModalProps['getOverseer']
 } = {}, apiOptions: Parameters<typeof authenticatedApi>[0] = {}) {
   testState.authenticatedApi = authenticatedApi(apiOptions)
   container = document.createElement('div')
@@ -202,6 +204,33 @@ describe('GatekeeperModal configurator readiness', () => {
 })
 
 describe('GatekeeperModal model pickers', () => {
+  it('creates a dedicated OCR connection for the selected language model', async () => {
+    stubResizeObserver()
+    const newAiModelGatekeeper = vi.fn<Overseer['newAiModelGatekeeper']>().mockResolvedValue(
+      { [Symbol.dispose]() {} } as unknown as Awaited<ReturnType<Overseer['newAiModelGatekeeper']>>)
+    await renderModal({getOverseer: () => ({newAiModelGatekeeper}) as
+      unknown as ReturnType<GatekeeperModalProps['getOverseer']>})
+    const group = document.body.querySelector<HTMLButtonElement>(
+      '[aria-controls="connection-group-panel-platform:ai-model"]')!
+    await act(async () => group.click())
+    await act(async () => document.getElementById('connection-group-panel-platform:ai-model')!
+      .querySelector('button')!.click())
+    await act(async () => document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="AI model connection type"]')!.click())
+    const ocr = Array.from(document.body.querySelectorAll<HTMLElement>('[role="option"]'))
+      .find(option => option.textContent === 'Vision / OCR')!
+    await act(async () => {
+      ocr.dispatchEvent(new MouseEvent('pointerdown', {bubbles: true}))
+      ocr.click()
+    })
+    expect(document.body.querySelector('[aria-label="AI model connection type"]')?.textContent)
+      .toContain('Vision / OCR')
+    const add = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent === 'Create connection')!
+    await act(async () => add.click())
+    expect(newAiModelGatekeeper).toHaveBeenCalledExactlyOnceWith(CHAT_MODEL.id, 'ocr')
+  })
+
   // A decision model can back an AI Model binding but can't run an agent. The AI Model picker labels
   // each model with its kind.
   it.each([

@@ -8,6 +8,8 @@ export interface AiModelConnectionConfigProps {
   decisionModels: AiChatAuthorInfo[]
   selectedModelId: string | undefined
   onSelectedModelIdChange: (id: string | undefined) => void
+  purpose?: 'ocr'
+  onPurposeChange: (purpose: 'ocr' | undefined) => void
   selectContainer?: PortalContainer
 }
 
@@ -16,6 +18,8 @@ export function AiModelConnectionConfig({
   decisionModels,
   selectedModelId,
   onSelectedModelIdChange,
+  purpose,
+  onPurposeChange,
   selectContainer,
 }: AiModelConnectionConfigProps) {
   const groups = [
@@ -53,6 +57,23 @@ export function AiModelConnectionConfig({
           ))}
         </Select>
       </ConnectionConfigField>
+      {chatModels.some(model => model.id === selectedModelId) && (
+        <ConnectionConfigField
+          label="Connection"
+          description="Use the model for text and images, or give this app a dedicated image-reading connection."
+        >
+          <Select
+            aria-label="AI model connection type"
+            container={selectContainer}
+            value={purpose ?? 'model'}
+            onValueChange={(value) => onPurposeChange(value === 'ocr' ? 'ocr' : undefined)}
+            renderValue={(value) => value === 'ocr' ? 'Vision / OCR' : 'Language model'}
+          >
+            <Select.Option value="model">Language model</Select.Option>
+            <Select.Option value="ocr">Vision / OCR</Select.Option>
+          </Select>
+        </ConnectionConfigField>
+      )}
     </section>
   )
 }
