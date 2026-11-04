@@ -63,8 +63,8 @@ import {
 } from "./bigquery-types";
 import {
   calendarEventOverlaps, calendarEventSortKey, eventPatchToGoogle, GoogleCalendarApi,
-  GoogleCalendarApiError, hasCalendarPrivateAccessRole, MAX_FREE_BUSY_CALENDARS, validateCalendarTimeWindow,
-  type LiveCalendarEvent,
+  GoogleCalendarApiError, hasCalendarPrivateAccessRole, MAX_FREE_BUSY_CALENDARS, newCalendarEventId,
+  validateCalendarTimeWindow, type LiveCalendarEvent,
 } from "./calendar-api";
 import {
   CALENDAR_EVENTS_ACTION, createEventVerdict, updateEventVerdict,
@@ -2588,6 +2588,12 @@ type GoogleCalendarActionBase = {
 type GoogleCalendarCreateAction = GoogleCalendarActionBase & {
   type: "createEvent";
   event: CalendarEventDraft;
+  /**
+   * The id the event is inserted under, chosen when it is queued so that an attempt whose reply
+   * was lost leaves an event a retry can recognize as its own. Absent on actions stored before
+   * ids were chosen, whose events Google names.
+   */
+  eventId?: string;
 }
 
 type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
@@ -2600,6 +2606,12 @@ type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
    * actions stored before verdicts were recorded, which were never auto-approvable.
    */
   autoApprovable?: boolean;
+  /**
+   * The undo patch, recorded from the event before the first attempt to write it and kept through
+   * retries, so a retry after a write whose reply was lost doesn't take that write's values as
+   * the ones to restore.
+   */
+  previous?: CalendarEventPatch;
 }
 
 type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
@@ -2848,12 +2860,25 @@ export class GoogleCalendarGatekeeperImpl
     if (!action) {
       throw new Error(`Unknown pending Google Calendar action: ${actionId}`);
     }
+    // An action applied again after an attempt whose reply was lost must not write twice or lose
+    // its undo; the kernel could guarantee that for every gatekeeper by never re-applying an
+    // action whose automatic apply was already attempted.
     pendingActions.markApplying(actionId);
 
     let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
     switch (action.type) {
       case "createEvent": {
-        let created = await api.createEvent(action.calendarId, action.event, action.sendUpdates);
+        let created: CalendarEvent;
+        try {
+          created = await api.createEvent(
+            action.calendarId, action.event, action.sendUpdates, action.eventId);
+        } catch (error) {
+          // The id is this action's own, so an event already holding it is an earlier attempt's.
+          if (!(action.eventId && error instanceof GoogleCalendarApiError && error.status === 409)) {
+            throw error;
+          }
+          created = await api.getEvent(action.calendarId, action.eventId);
+        }
         pendingActions.remove(actionId);
         this.ctx.storage.kv.put<GoogleCalendarRevertInfo>(this.#revertKey(actionId), {
           type: "createdEvent",
@@ -2877,7 +2902,8 @@ export class GoogleCalendarGatekeeperImpl
             (!oldEvent.etag || !updateEventVerdict(oldEvent, action.patch).autoApprovable)) {
           throw changedError;
         }
-        let previous = priorCalendarPatch(oldEvent, action.patch);
+        let previous = action.previous ?? priorCalendarPatch(oldEvent, action.patch);
+        pendingActions.put(actionId, {...action, previous});
         try {
           // Conditional on the version just judged, so guests added between the read and the
           // write cannot receive it.
@@ -3113,6 +3139,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
       submittedAt: Date.now(),
       sendUpdates: opts?.sendUpdates ?? "all",
       event,
+      eventId: newCalendarEventId(),
     };
     let actionId = this.#pendingActions.submit(action);
 

@@ -17,7 +17,8 @@ type GoogleEvent = {
 
 /**
  * A Google Calendar API fake holding the bound calendar's events. Each read reports the event's
- * version as its etag, and a PATCH carrying a stale If-Match fails with 412 as Google's does.
+ * version as its etag, a PATCH carrying a stale If-Match fails with 412 and an insert under an id
+ * already taken fails with 409, as Google's do.
  */
 class CalendarModel {
   readonly events = new Map<string, GoogleEvent>();
@@ -30,6 +31,14 @@ class CalendarModel {
   failCreates = false;
   /** Serves events without an etag, which Google's API does not promise to send. */
   omitEtags = false;
+  /** Loses the reply to the next write, after (`afterWrite`) or before it takes effect. */
+  loseNextReply?: "afterWrite" | "beforeWrite";
+
+  #loseReply(when: "afterWrite" | "beforeWrite"): void {
+    if (this.loseNextReply !== when) return;
+    this.loseNextReply = undefined;
+    throw new Error("Network connection lost.");
+  }
 
   /** Changes an event the way a collaborator editing it in Google would, giving it a new etag. */
   edit(id: string, change: Partial<GoogleEvent>): void {
@@ -55,23 +64,34 @@ class CalendarModel {
       let prefix = `/calendar/v3/calendars/${encodeURIComponent(TEST_CALENDAR_ID)}/events/`;
       if (request.method === "POST" && `${url.pathname}/` === prefix) {
         if (this.failCreates) return new Response("Bad Request", { status: 400 });
-        let body = await request.json();
+        let body = await request.json<GoogleEvent>();
+        if (body.id && this.events.has(body.id)) return new Response("Conflict", { status: 409 });
+        this.#loseReply("beforeWrite");
         this.created.push(body);
-        return Response.json({ ...body as object, id: `created-${this.created.length}` });
+        let created = { ...body, id: body.id ?? `created-${this.created.length}` };
+        this.events.set(created.id, created);
+        this.#loseReply("afterWrite");
+        return Response.json(created);
       }
       if (!url.pathname.startsWith(prefix)) throw new Error(`Unexpected request: ${request.url}`);
       let eventId = decodeURIComponent(url.pathname.slice(prefix.length));
       let event = this.events.get(eventId);
       if (!event) return new Response("Not Found", { status: 404 });
       let etag = () => `"${this.versions.get(eventId) ?? 0}"`;
+      if (request.method === "DELETE") {
+        this.events.delete(eventId);
+        return new Response(null, { status: 204 });
+      }
       if (request.method === "PATCH") {
         let ifMatch = request.headers.get("If-Match");
         if (ifMatch !== null && ifMatch !== etag()) {
           return new Response("Precondition Failed", { status: 412 });
         }
         let body = await request.json<Partial<GoogleEvent>>();
+        this.#loseReply("beforeWrite");
         this.patches.push({ eventId, body });
         this.edit(eventId, body);
+        this.#loseReply("afterWrite");
         return Response.json({ ...event, etag: etag() });
       }
       let read = this.omitEtags ? { ...event } : { ...event, etag: etag() };
@@ -255,5 +275,50 @@ describe("Google Calendar auto-approval", () => {
     expect(call.action).toMatchObject({ autoApprovable: false });
     expect(await hooks().applyAction("apply-meeting", call.actionId!)).toBeNull();
     expect(calendar.patches).toEqual([{ eventId: "meeting", body: { summary: "Moved" } }]);
+  });
+
+  it("creates an event once when applied again after a create whose reply was lost", async () => {
+    let calendar = new CalendarModel();
+    calendar.install();
+    let call = await hooks().createEvent("create-retry", draft);
+    calendar.loseNextReply = "afterWrite";
+
+    expect(await hooks().applyAction("create-retry", call.actionId!)).toMatch(/Network connection lost/);
+    expect(await hooks().applyAction("create-retry", call.actionId!)).toBeNull();
+    expect(calendar.created).toHaveLength(1);
+    expect(await hooks().applyAction("create-retry", call.actionId!)).toMatch(/Unknown pending/);
+
+    expect(await hooks().revertAction("create-retry", call.actionId!)).toBeNull();
+    expect(calendar.events.size).toBe(0);
+  });
+
+  it("creates the event on a retry when the failed attempt left nothing behind", async () => {
+    let calendar = new CalendarModel();
+    calendar.install();
+    let call = await hooks().createEvent("create-retry-unwritten", draft);
+    calendar.loseNextReply = "beforeWrite";
+
+    expect(await hooks().applyAction("create-retry-unwritten", call.actionId!))
+      .toMatch(/Network connection lost/);
+    expect(calendar.events.size).toBe(0);
+    expect(await hooks().applyAction("create-retry-unwritten", call.actionId!)).toBeNull();
+    expect(calendar.created).toHaveLength(1);
+    expect(calendar.events.size).toBe(1);
+  });
+
+  it("reverts to the original after an update applied again once its reply was lost", async () => {
+    let calendar = new CalendarModel();
+    calendar.add("meeting", { summary: "Original", attendees: [{ email: "guest@example.com" }] });
+    calendar.install();
+    let call = await hooks().updateEvent("update-retry", "meeting", { title: "Changed" });
+    expect(call.action).toMatchObject({ autoApprovable: false });
+    calendar.loseNextReply = "afterWrite";
+
+    expect(await hooks().applyAction("update-retry", call.actionId!)).toMatch(/Network connection lost/);
+    expect(await hooks().applyAction("update-retry", call.actionId!)).toBeNull();
+    expect(calendar.events.get("meeting")!.summary).toBe("Changed");
+
+    expect(await hooks().revertAction("update-retry", call.actionId!)).toBeNull();
+    expect(calendar.events.get("meeting")!.summary).toBe("Original");
   });
 });

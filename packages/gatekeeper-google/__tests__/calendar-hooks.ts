@@ -113,6 +113,15 @@ export class CalendarTestHooks extends DurableObject<Env> {
     }
   }
 
+  /** Revert an action, returning what it reported or the error it threw. */
+  async revertAction(facetName: string, actionId: number): Promise<unknown> {
+    try {
+      return (await this.#gatekeeper(facetName).revertAction(actionId)) ?? null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async autoApprovable(facetName: string): Promise<ActionKind[]> {
     return this.#gatekeeper(facetName).getAutoApprovableActions();
   }

@@ -214,6 +214,14 @@ export function validateCalendarTimeWindow(timeMin: Date, timeMax: Date, maxDays
   }
 }
 
+/**
+ * A fresh id for events.insert: a UUID without its hyphens, whose hex digits are all in the
+ * base32hex alphabet Google requires of client-chosen event ids.
+ */
+export function newCalendarEventId(): string {
+  return crypto.randomUUID().replaceAll("-", "");
+}
+
 export class GoogleCalendarApiError extends Error {
   constructor(readonly status: number, body: string) {
     super(`Google Calendar API request failed: ${status} ${body}`);
@@ -394,14 +402,19 @@ export class GoogleCalendarApi {
     });
   }
 
+  /**
+   * Inserts the event, under `id` when given (see `newCalendarEventId`); Google answers 409 when an
+   * event with that id already exists.
+   */
   async createEvent(
     calendarId: string,
     event: CalendarEventDraft,
     sendUpdates: CalendarSendUpdates = "all",
+    id?: string,
   ): Promise<CalendarEvent> {
     let created = await this.#fetch<GoogleCalendarEvent>(
       `/calendars/${encodeCalendarId(calendarId)}/events?sendUpdates=${encodeURIComponent(sendUpdates)}`,
-      { method: "POST", body: JSON.stringify(googleEventFromDraft(event)) },
+      { method: "POST", body: JSON.stringify({ ...googleEventFromDraft(event), ...(id ? { id } : {}) }) },
     );
     return calendarEventFromGoogle(created, { includeDescriptions: true });
   }
