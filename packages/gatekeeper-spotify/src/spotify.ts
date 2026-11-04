@@ -961,6 +961,13 @@ function describePlayerCommand(command: PlayerCommand): RenderedDescription {
   return builder.finish();
 }
 
+// The error for an apply that finds an earlier attempt to `what` may have landed.
+function mayHaveGoneThrough(what: string): Error {
+  return new Error(
+    `An earlier attempt to ${what} may have gone through, so it won't be sent again. Check the ` +
+    `playlist and discard this action; if the change is missing, ask for it again.`);
+}
+
 type RevertInfo =
   | { kind: "playlistTracks"; realId: string; previousUris: string[] }
   | { kind: "playlistDetails"; realId: string; previous: SpotifyPlaylistDetailsUpdate }
@@ -973,9 +980,9 @@ type StoredActionRecord = {
   rejectedAt?: number;
   revert?: RevertInfo;
   /**
-   * For playlistAdd / playlistReorder: set, together with `revert`, before the first write and
-   * cleared only when Spotify refused that write, so a later apply that finds it set knows an
-   * earlier write may have landed (see #performAction).
+   * For playlistCreate / playlistAdd / playlistReorder / playlistDetails: set, together with any
+   * `revert`, before the first write and cleared only when Spotify refused that write, so a later
+   * apply that finds it set knows an earlier write may have landed (see #markedWrite).
    */
   writeStartedAt?: number;
 };
@@ -1917,6 +1924,28 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     this.#retire(actionId, record);
   }
 
+  // Stores `record` with a `writeStartedAt` marker, then runs `write`, which calls `onCommitted`
+  // after each request Spotify accepted. Only Spotify refusing the first request (a 4xx reply)
+  // proves nothing landed, so only that clears the marker and `revert`: a 5xx can come from a
+  // gateway after the write went through. applyAction stores the record after a failure.
+  // This could move into the kernel: an auto-approval drainer that never re-applies an action
+  // whose automatic apply was already attempted would cover every gatekeeper.
+  async #markedWrite<T>(record: StoredActionRecord, persist: () => void, write: (onCommitted: () => void) => Promise<T>): Promise<T> {
+    record.writeStartedAt = Date.now();
+    persist();
+    let committed = false;
+    try {
+      return await write(() => { committed = true; });
+    } catch (error) {
+      const apiError = error instanceof SpotifyApiError ? error : (error as Error | undefined)?.cause;
+      if (!committed && apiError instanceof SpotifyApiError && apiError.status < 500) {
+        delete record.writeStartedAt;
+        delete record.revert;
+      }
+      throw error;
+    }
+  }
+
   // `persist` stores `record` as it stands, for state that must be durable before a write.
   async #performAction(action: SpotifyAction, record: StoredActionRecord, persist: () => void): Promise<void> {
     switch (action.type) {
@@ -1927,12 +1956,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       case "followArtists": await this.#withApi(api => api.saveToLibrary(action.artistIds.map(artistUri))); break;
       case "unfollowArtists": await this.#withApi(api => api.removeFromLibrary(action.artistIds.map(artistUri))); break;
       case "playlistCreate": {
-        const created = await this.#withApi(api => api.createPlaylist({
+        // Spotify takes no key to recognize a repeated create, so one whose outcome is unknown is
+        // never sent again: a second playlist would be one that revert doesn't know about.
+        if (record.writeStartedAt !== undefined) throw mayHaveGoneThrough(`create playlist "${action.name}"`);
+        const created = await this.#markedWrite(record, persist, () => this.#withApi(api => api.createPlaylist({
           name: action.name,
           description: action.description,
           public: action.public,
           collaborative: action.collaborative,
-        }));
+        })));
         this.ctx.storage.kv.put(this.#provisionalKey(action.provisionalId), { realId: created.id });
         record.revert = { kind: "playlistCreate", realId: created.id };
         break;
@@ -1946,14 +1978,9 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
         // takes no key to recognize a repeat, and a reorder's snapshot_id names a snapshot to apply it
         // to rather than refusing a stale one. So an earlier write whose outcome is unknown is never
         // sent again, and the revert snapshot it stored, taken before any write, is kept.
-        // This could move into the kernel: an auto-approval drainer that never re-applies an action
-        // whose automatic apply was already attempted would cover every gatekeeper.
-        const fenced = action.type === "playlistAdd" || action.type === "playlistReorder";
-        if (fenced && record.writeStartedAt !== undefined) {
-          throw new Error(
-            `An earlier attempt to ${action.type === "playlistAdd" ? "add these tracks to" : "reorder"} ` +
-            `playlist ${action.playlistId} may have gone through, so it won't be sent again. Check the ` +
-            `playlist and discard this action; if the change is missing, ask for it again.`);
+        if ((action.type === "playlistAdd" || action.type === "playlistReorder") && record.writeStartedAt !== undefined) {
+          throw mayHaveGoneThrough(
+            `${action.type === "playlistAdd" ? "add these tracks to" : "reorder"} playlist ${action.playlistId}`);
         }
         // Snapshot the pre-edit ordering so revert can restore it via replace, but only for
         // reasonably-sized playlists (keeps the stored value small). NOTE: revert is best-effort —
@@ -1963,43 +1990,35 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
           const previous = await this.#materializePlaylistEntries(realId);
           record.revert = { kind: "playlistTracks", realId, previousUris: previous.map(e => e.uri).filter(Boolean) };
         }
-        if (fenced) {
-          record.writeStartedAt = Date.now();
-          persist();
-        }
-        let committed = false;
-        try {
-          if (action.type === "playlistAdd") await this.#applyAddTracks(realId, action.uris, action.position, () => { committed = true; });
-          else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
-          else if (action.type === "playlistReplace") await this.#setPlaylistTracks(realId, action.uris);
-          else await this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength));
-        } catch (error) {
-          // Only Spotify refusing the first write (a 4xx reply) proves nothing landed; a 5xx can
-          // come from a gateway after the write went through. applyAction stores the record.
-          const apiError = error instanceof SpotifyApiError ? error : (error as Error | undefined)?.cause;
-          if (fenced && !committed && apiError instanceof SpotifyApiError && apiError.status < 500) {
-            delete record.writeStartedAt;
-            delete record.revert;
-          }
-          throw error;
-        }
+        if (action.type === "playlistAdd") {
+          await this.#markedWrite(record, persist, onCommitted => this.#applyAddTracks(realId, action.uris, action.position, onCommitted));
+        } else if (action.type === "playlistReorder") {
+          await this.#markedWrite(record, persist, () =>
+            this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength)));
+        } else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
+        else await this.#setPlaylistTracks(realId, action.uris);
         this.#invalidatePlaylist(realId);
         break;
       }
       case "playlistDetails": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
-        const current = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
-        record.revert = {
-          kind: "playlistDetails",
-          realId,
-          previous: {
-            name: current.name,
-            description: current.description ?? undefined,
-            public: current.public ?? undefined,
-            collaborative: current.collaborative,
-          },
-        };
-        await this.#withApi(api => api.changePlaylistDetails(realId, action.update));
+        // Details are set absolutely, so a retry may send them again, but it keeps the snapshot an
+        // earlier attempt stored: once that write may have landed, the playlist no longer shows
+        // the values to revert to.
+        if (record.writeStartedAt === undefined) {
+          const current = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
+          record.revert = {
+            kind: "playlistDetails",
+            realId,
+            previous: {
+              name: current.name,
+              description: current.description ?? undefined,
+              public: current.public ?? undefined,
+              collaborative: current.collaborative,
+            },
+          };
+        }
+        await this.#markedWrite(record, persist, () => this.#withApi(api => api.changePlaylistDetails(realId, action.update)));
         this.#invalidatePlaylist(realId);
         break;
       }

@@ -213,3 +213,75 @@ describe("re-applying a playlist edit whose earlier attempt is unknown", () => {
     expect(playlist.uris).toEqual(["A", "B"]);
   });
 });
+
+// Playlist creates and details edits over the stubbed fetch, failing writes as in fakePlaylist.
+function fakePlaylists() {
+  const state = { created: [] as string[], name: "Original", failures: [] as ("lost" | "refused" | undefined)[] };
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit = {}) => {
+    const { pathname } = new URL(url);
+    const method = init.method ?? "GET";
+    if (method === "GET" && pathname === "/v1/playlists/p1") {
+      return Response.json({ id: "p1", name: state.name, uri: "spotify:playlist:p1", owner: { id: "user" } });
+    }
+    const failure = state.failures.shift();
+    if (failure === "refused") return Response.json({ error: { message: "Too many requests" } }, { status: 429 });
+    const body = JSON.parse(init.body as string);
+    let reply: Response;
+    if (method === "POST" && pathname === "/v1/me/playlists") {
+      const id = `new${state.created.length + 1}`;
+      state.created.push(id);
+      reply = Response.json({ id, name: body.name, uri: `spotify:playlist:${id}`, owner: { id: "user" } });
+    } else if (method === "PUT" && pathname === "/v1/playlists/p1") {
+      if (body.name !== undefined) state.name = body.name;
+      reply = new Response(null, { status: 200 });
+    } else {
+      throw new Error(`Unexpected ${method} ${pathname}`);
+    }
+    if (failure === "lost") throw new TypeError("Network connection lost.");
+    return reply;
+  }));
+  return state;
+}
+
+describe("re-applying a playlist create or details edit whose earlier attempt is unknown", () => {
+  it("won't create the playlist again after a create whose reply was lost", async () => {
+    const state = fakePlaylists();
+    state.failures = ["lost"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistCreate("Mix", { public: false }));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    await expect(gk.applyAction(id)).rejects.toThrow(/may have gone through/);
+
+    expect(state.created).toEqual(["new1"]);
+    expect(kv.get(`action:${id}`)).toMatchObject({ state: "failed" });
+  });
+
+  it("creates once on a retry after Spotify refused the first create", async () => {
+    const state = fakePlaylists();
+    state.failures = ["refused"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistCreate("Mix", { public: false }));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Too many requests");
+    await gk.applyAction(id);
+
+    expect(state.created).toEqual(["new1"]);
+    expect(kv.get(`retiredAction:${id}`)).toMatchObject({ state: "approved", revert: { realId: "new1" } });
+  });
+
+  it("keeps the details from before the first attempt to revert to after a rename whose reply was lost", async () => {
+    const state = fakePlaylists();
+    state.failures = ["lost"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistDetails("p1", { name: "Changed" }));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    await gk.applyAction(id);
+
+    expect(state.name).toBe("Changed");
+    expect(kv.get(`retiredAction:${id}`)).toMatchObject({ state: "approved", revert: { previous: { name: "Original" } } });
+    await gk.revertAction(id);
+    expect(state.name).toBe("Original");
+  });
+});
