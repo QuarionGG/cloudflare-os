@@ -157,7 +157,7 @@ async function submitted(gk: InstanceType<typeof SpotifyGatekeeperImpl>, action:
 }
 
 describe("re-applying a playlist edit whose earlier attempt is unknown", () => {
-  it("won't add the tracks again after an add whose reply was lost, keeping the original order to revert to", async () => {
+  it("won't add the tracks again after an add whose reply was lost", async () => {
     const playlist = fakePlaylist(["A", "B"]);
     playlist.failures = ["lost"];
     const { gk, kv } = gatekeeper();
@@ -171,7 +171,7 @@ describe("re-applying a playlist edit whose earlier attempt is unknown", () => {
     expect(kv.get(`action:${id}`)).toMatchObject({ state: "failed", revert: { previousUris: ["A", "B"] } });
   });
 
-  it("won't move a range again after a reorder whose reply was lost, keeping the original order to revert to", async () => {
+  it("won't move a range again after a reorder whose reply was lost", async () => {
     const playlist = fakePlaylist(["A", "B", "C"]);
     playlist.failures = ["lost"];
     const { gk, kv } = gatekeeper();
@@ -280,6 +280,21 @@ describe("re-applying a playlist create or details edit whose earlier attempt is
     await gk.applyAction(id);
 
     expect(state.name).toBe("Changed");
+    expect(kv.get(`retiredAction:${id}`)).toMatchObject({ state: "approved", revert: { previous: { name: "Original" } } });
+    await gk.revertAction(id);
+    expect(state.name).toBe("Original");
+  });
+
+  it("keeps the first snapshot when a retry after a lost rename reply is refused", async () => {
+    const state = fakePlaylists();
+    state.failures = ["lost", "refused"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistDetails("p1", { name: "Changed" }));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    await expect(gk.applyAction(id)).rejects.toThrow("Too many requests");
+    await gk.applyAction(id);
+
     expect(kv.get(`retiredAction:${id}`)).toMatchObject({ state: "approved", revert: { previous: { name: "Original" } } });
     await gk.revertAction(id);
     expect(state.name).toBe("Original");

@@ -1931,6 +1931,9 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // This could move into the kernel: an auto-approval drainer that never re-applies an action
   // whose automatic apply was already attempted would cover every gatekeeper.
   async #markedWrite<T>(record: StoredActionRecord, persist: () => void, write: (onCommitted: () => void) => Promise<T>): Promise<T> {
+    // A refusal proves only that this attempt wrote nothing; an earlier one that set the marker
+    // may still have landed, so its snapshot stays.
+    const earlier = record.writeStartedAt !== undefined;
     record.writeStartedAt = Date.now();
     persist();
     let committed = false;
@@ -1938,7 +1941,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       return await write(() => { committed = true; });
     } catch (error) {
       const apiError = error instanceof SpotifyApiError ? error : (error as Error | undefined)?.cause;
-      if (!committed && apiError instanceof SpotifyApiError && apiError.status < 500) {
+      if (!earlier && !committed && apiError instanceof SpotifyApiError && apiError.status < 500) {
         delete record.writeStartedAt;
         delete record.revert;
       }
@@ -1977,7 +1980,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
         // An add or a reorder applied twice adds the tracks again or moves the range again: Spotify
         // takes no key to recognize a repeat, and a reorder's snapshot_id names a snapshot to apply it
         // to rather than refusing a stale one. So an earlier write whose outcome is unknown is never
-        // sent again, and the revert snapshot it stored, taken before any write, is kept.
+        // sent again, and the action can only be discarded.
         if ((action.type === "playlistAdd" || action.type === "playlistReorder") && record.writeStartedAt !== undefined) {
           throw mayHaveGoneThrough(
             `${action.type === "playlistAdd" ? "add these tracks to" : "reorder"} playlist ${action.playlistId}`);
