@@ -234,7 +234,9 @@ async function describeBinding(
     chatId: number,
     hooks: Pick<AgentHooks, "describeBinding" | "describeGitBinding" | "listGadgetInfo">)
     : Promise<string> {
-  if (gadget === undefined) {
+  // Some model tool callers fill an unused optional string with "". A gadget's env name
+  // cannot be empty, so treat this as the default chat scope, just like omission.
+  if (gadget === undefined || gadget === "") {
     let envName = `env.${name}`;
     let entry = chatBindings.get(name);
     if (!entry && name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);

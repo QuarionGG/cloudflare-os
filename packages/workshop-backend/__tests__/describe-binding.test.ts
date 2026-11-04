@@ -120,6 +120,21 @@ async function runDescribeTurn(impl: any): Promise<Context> {
 }
 
 describe("describeBinding", () => {
+  it("treats an empty optional gadget selector as the chat's own env", () => withImpl(async impl => {
+    seedWorkspace(impl);
+    let contexts = await runScriptedTurn(impl, [
+      fauxAssistantMessage([
+        fauxToolCall("describeBinding", {name: "DB", gadget: ""}),
+        fauxToolCall("describeBinding", {name: "GIT", gadget: ""}),
+      ], {stopReason: "toolUse"}),
+      fauxAssistantMessage(fauxText("Done.")),
+    ]);
+    let texts = toolResultTexts(contexts[1]);
+    expect(texts[0]).toBe("env.DB is gatekeeper 5");
+    expect(texts[1]).toContain("Binding: env.GIT");
+    expect(describeCalls(impl).every(call => call.error === undefined)).toBe(true);
+  }));
+
   it("describes bindings in a gadget's env and records the descriptions",
       () => withImpl(async impl => {
     seedWorkspace(impl);
