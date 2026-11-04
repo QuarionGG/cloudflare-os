@@ -972,6 +972,12 @@ type StoredActionRecord = {
   appliedAt?: number;
   rejectedAt?: number;
   revert?: RevertInfo;
+  /**
+   * For playlistAdd / playlistReorder: set, together with `revert`, before the first write and
+   * cleared only when Spotify refused that write, so a later apply that finds it set knows an
+   * earlier write may have landed (see #performAction).
+   */
+  writeStartedAt?: number;
 };
 
 // A track as it sits in a (possibly simulated) playlist.
@@ -1838,11 +1844,12 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // -------------------------------------------------------------------------
   // Action lifecycle (apply / reject / revert)
 
-  async #applyAddTracks(realId: string, uris: string[], position?: number): Promise<void> {
+  async #applyAddTracks(realId: string, uris: string[], position: number | undefined, onCommitted: () => void): Promise<void> {
     let pos = position;
     for (let i = 0; i < uris.length; i += PLAYLIST_WRITE_CHUNK) {
       const chunk = uris.slice(i, i + PLAYLIST_WRITE_CHUNK);
       await this.#withApi(api => api.addPlaylistItems(realId, chunk, pos));
+      onCommitted();
       if (pos !== undefined) pos += chunk.length;
     }
   }
@@ -1896,7 +1903,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       this.#invalidatePendingCache();
     }
     try {
-      await this.#performAction(action, record);
+      await this.#performAction(action, record, () => this.ctx.storage.kv.put(this.#actionKey(actionId), record));
     } catch (error) {
       // Apply failed (and won't take effect on Spotify). Mark it failed so its simulated effect
       // stops masking real library/follow/playlist state, while keeping it retryable/discardable.
@@ -1910,7 +1917,8 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     this.#retire(actionId, record);
   }
 
-  async #performAction(action: SpotifyAction, record: StoredActionRecord): Promise<void> {
+  // `persist` stores `record` as it stands, for state that must be durable before a write.
+  async #performAction(action: SpotifyAction, record: StoredActionRecord, persist: () => void): Promise<void> {
     switch (action.type) {
       case "saveTracks": await this.#withApi(api => api.saveToLibrary(action.trackIds.map(trackUri))); break;
       case "removeSavedTracks": await this.#withApi(api => api.removeFromLibrary(action.trackIds.map(trackUri))); break;
@@ -1934,6 +1942,19 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       case "playlistReorder":
       case "playlistReplace": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
+        // An add or a reorder applied twice adds the tracks again or moves the range again: Spotify
+        // takes no key to recognize a repeat, and a reorder's snapshot_id names a snapshot to apply it
+        // to rather than refusing a stale one. So an earlier write whose outcome is unknown is never
+        // sent again, and the revert snapshot it stored, taken before any write, is kept.
+        // This could move into the kernel: an auto-approval drainer that never re-applies an action
+        // whose automatic apply was already attempted would cover every gatekeeper.
+        const fenced = action.type === "playlistAdd" || action.type === "playlistReorder";
+        if (fenced && record.writeStartedAt !== undefined) {
+          throw new Error(
+            `An earlier attempt to ${action.type === "playlistAdd" ? "add these tracks to" : "reorder"} ` +
+            `playlist ${action.playlistId} may have gone through, so it won't be sent again. Check the ` +
+            `playlist and discard this action; if the change is missing, ask for it again.`);
+        }
         // Snapshot the pre-edit ordering so revert can restore it via replace, but only for
         // reasonably-sized playlists (keeps the stored value small). NOTE: revert is best-effort —
         // unavailable items (no uri) and local files are dropped, and the replace-based restore
@@ -1942,10 +1963,26 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
           const previous = await this.#materializePlaylistEntries(realId);
           record.revert = { kind: "playlistTracks", realId, previousUris: previous.map(e => e.uri).filter(Boolean) };
         }
-        if (action.type === "playlistAdd") await this.#applyAddTracks(realId, action.uris, action.position);
-        else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
-        else if (action.type === "playlistReplace") await this.#setPlaylistTracks(realId, action.uris);
-        else await this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength));
+        if (fenced) {
+          record.writeStartedAt = Date.now();
+          persist();
+        }
+        let committed = false;
+        try {
+          if (action.type === "playlistAdd") await this.#applyAddTracks(realId, action.uris, action.position, () => { committed = true; });
+          else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
+          else if (action.type === "playlistReplace") await this.#setPlaylistTracks(realId, action.uris);
+          else await this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength));
+        } catch (error) {
+          // Only Spotify refusing the first write (a 4xx reply) proves nothing landed; a 5xx can
+          // come from a gateway after the write went through. applyAction stores the record.
+          const apiError = error instanceof SpotifyApiError ? error : (error as Error | undefined)?.cause;
+          if (fenced && !committed && apiError instanceof SpotifyApiError && apiError.status < 500) {
+            delete record.writeStartedAt;
+            delete record.revert;
+          }
+          throw error;
+        }
         this.#invalidatePlaylist(realId);
         break;
       }

@@ -114,3 +114,102 @@ describe("submitActionForApproval when the action is applied before the reply", 
     expect(kv.has(`action:${action.approvalId}`)).toBe(false);
   });
 });
+
+// A playlist "p1" served over the stubbed fetch. Each write takes the next entry of `failures`:
+// "lost" lands the write and then loses its reply, "refused" answers 429 without landing it.
+function fakePlaylist(initial: string[]) {
+  const playlist = { uris: [...initial], writes: 0, failures: [] as ("lost" | "refused" | undefined)[] };
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit = {}) => {
+    const { pathname } = new URL(url);
+    const method = init.method ?? "GET";
+    if (method === "GET" && pathname === "/v1/playlists/p1") {
+      return Response.json({ id: "p1", name: "P", uri: "spotify:playlist:p1", owner: { id: "user" },
+        items: { total: playlist.uris.length } });
+    }
+    if (pathname !== "/v1/playlists/p1/items") throw new Error(`Unexpected ${method} ${pathname}`);
+    if (method === "GET") {
+      const album = { id: "al", name: "Album", uri: "spotify:album:al" };
+      return Response.json({ total: playlist.uris.length,
+        items: playlist.uris.map(uri => ({ item: { id: uri, name: uri, uri, album } })) });
+    }
+    const failure = playlist.failures.shift();
+    if (failure === "refused") return Response.json({ error: { message: "Too many requests" } }, { status: 429 });
+    playlist.writes++;
+    const body = JSON.parse(init.body as string);
+    if (method === "POST") playlist.uris.splice(body.position ?? playlist.uris.length, 0, ...body.uris);
+    else if (body.uris) playlist.uris = body.uris;
+    else {
+      const moved = playlist.uris.splice(body.range_start, body.range_length);
+      const before = body.insert_before > body.range_start ? body.insert_before - body.range_length : body.insert_before;
+      playlist.uris.splice(before, 0, ...moved);
+    }
+    if (failure === "lost") throw new TypeError("Network connection lost.");
+    return Response.json({ snapshot_id: "snapshot" });
+  }));
+  return playlist;
+}
+
+// Submits an action that is left pending for the test to apply.
+async function submitted(gk: InstanceType<typeof SpotifyGatekeeperImpl>, action: { approvalId: number }) {
+  await gk.submitActionForApproval({ submitAction: async () => {} } as never, action as never,
+    { title: "Edit playlist", implementsRevert: true });
+  return action.approvalId;
+}
+
+describe("re-applying a playlist edit whose earlier attempt is unknown", () => {
+  it("won't add the tracks again after an add whose reply was lost, keeping the original order to revert to", async () => {
+    const playlist = fakePlaylist(["A", "B"]);
+    playlist.failures = ["lost"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistAdd("p1", ["X"]));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    await expect(gk.applyAction(id)).rejects.toThrow(/may have gone through/);
+
+    expect(playlist.writes).toBe(1);
+    expect(playlist.uris).toEqual(["A", "B", "X"]);
+    expect(kv.get(`action:${id}`)).toMatchObject({ state: "failed", revert: { previousUris: ["A", "B"] } });
+  });
+
+  it("won't move a range again after a reorder whose reply was lost, keeping the original order to revert to", async () => {
+    const playlist = fakePlaylist(["A", "B", "C"]);
+    playlist.failures = ["lost"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistReorder("p1", 0, 3, 1));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Network connection lost.");
+    await expect(gk.applyAction(id)).rejects.toThrow(/may have gone through/);
+
+    expect(playlist.writes).toBe(1);
+    expect(playlist.uris).toEqual(["B", "C", "A"]);
+    expect(kv.get(`action:${id}`)).toMatchObject({ state: "failed", revert: { previousUris: ["A", "B", "C"] } });
+  });
+
+  it("won't resend an add after a later chunk failed once an earlier one landed", async () => {
+    const playlist = fakePlaylist(["A"]);
+    playlist.failures = [undefined, "refused"];
+    const { gk } = gatekeeper();
+    const uris = Array.from({ length: 101 }, (_, i) => `T${i}`);
+    const id = await submitted(gk, gk.preparePlaylistAdd("p1", uris));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Too many requests");
+    await expect(gk.applyAction(id)).rejects.toThrow(/may have gone through/);
+    expect(playlist.writes).toBe(1);
+  });
+
+  it("applies once on a retry after Spotify refused the first write, and reverts to the original", async () => {
+    const playlist = fakePlaylist(["A", "B"]);
+    playlist.failures = ["refused"];
+    const { gk, kv } = gatekeeper();
+    const id = await submitted(gk, gk.preparePlaylistAdd("p1", ["X"]));
+
+    await expect(gk.applyAction(id)).rejects.toThrow("Too many requests");
+    await gk.applyAction(id);
+
+    expect(playlist.writes).toBe(1);
+    expect(playlist.uris).toEqual(["A", "B", "X"]);
+    expect(kv.get(`retiredAction:${id}`)).toMatchObject({ state: "approved" });
+    await gk.revertAction(id);
+    expect(playlist.uris).toEqual(["A", "B"]);
+  });
+});

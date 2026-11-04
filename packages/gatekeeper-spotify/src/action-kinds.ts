@@ -65,9 +65,9 @@ export function autoApprovalOf(action: SpotifyAction): Pick<ActionDescription, "
     // Prepare resolves an omitted `public`, so only records staged before that lack it.
     case "playlistCreate":
       return verdict("createPlaylist", action.public === false && action.collaborative !== true);
-    // Spotify's add takes no key to recognize a repeat, so an apply retried after its result was
-    // lost can add the tracks again, or move a range twice. Unlike a skipped track, that is left in
-    // the playlist for the user to see and undo, so these stay auto-approvable.
+    // Spotify takes no key to recognize a repeated add or move, so an apply whose result was lost
+    // is never sent again: the retry fails asking the user to check the playlist, and revert keeps
+    // the order from before the first attempt.
     case "playlistAdd":
     case "playlistReorder":
       return verdict("addAndReorderTracks", true);
