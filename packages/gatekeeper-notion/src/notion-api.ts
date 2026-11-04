@@ -1025,19 +1025,16 @@ export class NotionApi {
   }
 
   async #request<T>(method: string, path: string, body?: unknown, version?: string): Promise<T> {
-    let token = await this.#getToken();
-    let response = await this.#send(method, path, token, body, version);
+    let response = await this.#send(method, path, await this.#getToken(), body, version);
 
     // On auth failure, try once to refresh the token, then retry the request. If refresh fails
     // (e.g. no/invalid refresh token), keep the original 401 so the caller sees a clean auth error
-    // — the refresh callback is responsible for notifying the Workshop of credential expiry.
+    // — the refresh callback is responsible for notifying the Workshop of credential expiry. A
+    // failure of the retried send propagates as it is: that write may have landed, so it must not
+    // pass for the 401 Notion answered before it.
     if (response.status === 401 && this.#refresh) {
-      try {
-        token = await this.#refresh();
-        response = await this.#send(method, path, token, body, version);
-      } catch {
-        // fall through with the original 401 response
-      }
+      const token = await this.#refresh().catch(() => undefined);
+      if (token !== undefined) response = await this.#send(method, path, token, body, version);
     }
 
     if (!response.ok) {

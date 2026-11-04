@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ConfluenceStore,
   applyStoredAction,
@@ -10,7 +10,7 @@ import {
   type UploadAttachmentAction,
 } from "../src/confluence-actions";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
-import { ConfluenceApiError, type ConfluenceApi } from "../src/confluence-api";
+import { ConfluenceApi, ConfluenceApiError } from "../src/confluence-api";
 
 type Storage = ConstructorParameters<typeof ConfluenceStore>[0];
 
@@ -266,6 +266,67 @@ describe("applyStoredAction", () => {
     expect(page.version).toBe(4);
     expect(page.body.match(/more/g)).toHaveLength(1);
     expect(store.getAction(id)?.state).toBe("applied");
+  });
+
+  it("appends on a retry after Confluence refused the first attempt and the page was edited since", async () => {
+    const { api } = makeApi();
+    const page = { version: 3, body: "<p>body</p>" };
+    let refuse = true;
+    api.getContentById = (async (id: string) => ({
+      id, type: "page", status: "current", title: "Title",
+      version: { number: page.version }, body: { storage: { value: page.body } },
+    })) as never;
+    api.updateContent = (async (b: { version: number; storageValue: string }) => {
+      if (refuse) { refuse = false; throw new ConfluenceApiError(409, "Conflict"); }
+      Object.assign(page, { version: b.version, body: b.storageValue });
+      return {};
+    }) as never;
+    const store = storeWith(api);
+    const id = stage(store, { type: "appendContent", contentId: "123", markdown: "more" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Conflict");
+    Object.assign(page, { version: 4, body: "<p>edited</p>" });
+    await applyStoredAction(store, id);
+
+    expect(page.version).toBe(5);
+    expect(page.body.match(/more/g)).toHaveLength(1);
+    expect(store.getAction(id)?.state).toBe("applied");
+  });
+
+  describe("over the API client", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("won't post a comment again after the retry following a token refresh lost its reply", async () => {
+      // The expired token is refused; the refreshed one's post lands, its reply lost.
+      const comments: string[] = [];
+      vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+        if (new Headers(init.headers).get("Authorization") === "Bearer stale") {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        if (init.method === "GET") {
+          return Response.json({
+            id: "555", status: "current", title: "Title", version: { number: 3 },
+            body: { storage: { value: "<p>body</p>" } },
+          });
+        }
+        comments.push(String(init.body));
+        throw new TypeError("Network connection lost.");
+      });
+      const api = new ConfluenceApi({
+        cloudId: "cloud-1", webBase: "https://example.atlassian.net/wiki",
+        getToken: async () => "stale", refresh: async () => "fresh",
+      });
+      const store = storeWith(api);
+      const id = stage(store, { type: "addComment", contentId: "555", text: "hi" });
+
+      const error = await applyStoredAction(store, id).catch((err: unknown) => err);
+      expect(error).not.toBeInstanceOf(ConfluenceApiError);
+      expect(error).toEqual(new TypeError("Network connection lost."));
+      await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+      expect(comments).toHaveLength(1);
+      expect(store.getAction(id)?.state).toBe("pending");
+    });
   });
 });
 

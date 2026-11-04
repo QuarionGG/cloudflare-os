@@ -615,16 +615,15 @@ export class ConfluenceApi {
   }
 
   // Core request: `path` is the gateway-relative path (e.g. "/wiki/api/v2/pages/1"). Refreshes the
-  // token once on a 401, then surfaces a clean error.
+  // token once on a 401, then surfaces a clean error. A failed refresh leaves the original 401
+  // standing; a failure of the retried send propagates as it is, because that write may have
+  // landed and must not pass for the 401 Confluence answered before it.
   async #request<T>(method: string, path: string, init?: RequestInit): Promise<T> {
     const url = `${this.#base()}${path}`;
-    let token = await this.#getToken();
-    let response = await this.#send(method, url, token, init);
+    let response = await this.#send(method, url, await this.#getToken(), init);
     if (response.status === 401 && this.#refresh) {
-      try {
-        token = await this.#refresh();
-        response = await this.#send(method, url, token, init);
-      } catch { /* fall through with the original 401 */ }
+      const token = await this.#refresh().catch(() => undefined);
+      if (token !== undefined) response = await this.#send(method, url, token, init);
     }
     if (!response.ok) {
       const detail = await response.text().catch(() => "");

@@ -80,7 +80,8 @@ export type StoredActionRecord = {
   applyStartedAt?: number;
   /**
    * For appendContent: the version of the page the append was built on, recorded before the write
-   * so a retry can tell whether the page has moved on since (see applyAction).
+   * and cleared if Confluence refused it, so a retry can tell whether the page has moved on since an
+   * attempt that may have landed (see applyAction).
    */
   appendBaseVersion?: number;
   /**
@@ -670,14 +671,24 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
       record.appendBaseVersion = version;
       store.putAction(record);
       const combined = (current.body?.storage?.value ?? "") + markdownToStorage(action.markdown);
-      await api.updateContent({
-        id,
-        type: current.type === "blogpost" ? "blogpost" : "page",
-        title: current.title,
-        version: version + 1,
-        storageValue: combined,
-        status: preservedStatus(current),
-      });
+      try {
+        await api.updateContent({
+          id,
+          type: current.type === "blogpost" ? "blogpost" : "page",
+          title: current.title,
+          version: version + 1,
+          storageValue: combined,
+          status: preservedStatus(current),
+        });
+      } catch (err) {
+        // A 4xx means Confluence refused the append, so the page holds none of it; a 5xx can come
+        // after it took effect.
+        if (err instanceof ConfluenceApiError && err.status < 500) {
+          record.appendBaseVersion = undefined;
+          store.putAction(record);
+        }
+        throw err;
+      }
       store.invalidateContent(id);
       break;
     }

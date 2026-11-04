@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AUTO_APPROVABLE_KINDS,
   applyStoredAction,
@@ -8,7 +8,7 @@ import {
   stageAction,
   type NotionAction,
 } from "../src/notion-actions";
-import { NotionApiError } from "../src/notion-api";
+import { NotionApi, NotionApiError } from "../src/notion-api";
 
 const databaseRow = (titlePropertyName?: string) => describeAction({
   type: "createPage",
@@ -339,5 +339,31 @@ describe("applyStoredAction", () => {
 
     expect(created).toEqual(["New"]);
     expect(store.getAction(id)?.state).toBe("pending");
+  });
+
+  describe("over the API client", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("won't post a comment again after the retry following a token refresh lost its reply", async () => {
+      // The expired token is refused; the refreshed one's post lands, its reply lost.
+      const comments: string[] = [];
+      vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+        if (new Headers(init.headers).get("Authorization") === "Bearer stale") {
+          return Response.json({ code: "unauthorized", message: "API token is invalid." }, { status: 401 });
+        }
+        comments.push(String(init.body));
+        throw new TypeError("Network connection lost.");
+      });
+      const store = storeWith(new NotionApi(async () => "stale", async () => "fresh"));
+      const id = stage(store, { type: "addComment", pageId: "page-1", text: "Hi" });
+
+      const error = await applyStoredAction(store, id).catch((err: unknown) => err);
+      expect(error).not.toBeInstanceOf(NotionApiError);
+      expect(error).toEqual(new TypeError("Network connection lost."));
+      await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+      expect(comments).toHaveLength(1);
+      expect(store.getAction(id)?.state).toBe("pending");
+    });
   });
 });
