@@ -18,6 +18,7 @@ import type {
   ActionDescription, ActionKind, ApprovalQueue, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
+  ConfluenceApiError,
   ConfluenceApi,
   contentBodyMarkdown,
   contentToSummary,
@@ -82,6 +83,12 @@ export type StoredActionRecord = {
    * so a retry can tell whether the page has moved on since (see applyAction).
    */
   appendBaseVersion?: number;
+  /**
+   * For createContent / addComment / uploadAttachment: when the write was sent to Confluence,
+   * recorded before sending and cleared if Confluence refused it, so a later apply can tell an
+   * earlier attempt may have gone through (see writeOnce).
+   */
+  writeDispatchedAt?: number;
   /** For createContent / addComment: the real content ID assigned on apply. */
   createdContentId?: string;
   /** For uploadAttachment: the attachment ID assigned on apply. */
@@ -583,6 +590,35 @@ function preservedStatus(current: ContentResponse): "draft" | "current" {
   return current.status === "draft" ? "draft" : "current";
 }
 
+/**
+ * Sends `write`, which Confluence would repeat if sent twice, at most once per action: an attempt
+ * whose outcome is unknown (its reply lost, or the DO restarted) fences off every later one, and
+ * only a refusal from Confluence lets a retry send it again.
+ */
+async function writeOnce<T>(
+  store: ConfluenceStore, record: StoredActionRecord, attempt: string, result: string, write: () => Promise<T>,
+): Promise<T> {
+  // The auto-approval drainer not re-applying an action whose automatic apply was already
+  // attempted would cover this for every gatekeeper, so this fence could move into the kernel.
+  if (record.writeDispatchedAt !== undefined) {
+    throw new Error(
+      `An earlier attempt to ${attempt} may have gone through, so it won't be tried again. Check ` +
+      `the page and discard this action; if the ${result} is missing, ask for it again.`);
+  }
+  record.writeDispatchedAt = Date.now();
+  store.putAction(record);
+  try {
+    return await write();
+  } catch (err) {
+    // A 4xx means Confluence refused the write; a 5xx can come after it took effect.
+    if (err instanceof ConfluenceApiError && err.status < 500) {
+      record.writeDispatchedAt = undefined;
+      store.putAction(record);
+    }
+    throw err;
+  }
+}
+
 async function applyAction(store: ConfluenceStore, record: StoredActionRecord): Promise<void> {
   const api = store.api;
   const action = record.action;
@@ -593,15 +629,12 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
       if (!spaceKey) throw new Error("Cannot create content without a space.");
       const spaceId = await store.getSpaceId(spaceKey);
       const storageValue = markdownToStorage(action.content ?? "");
-      const created = action.kind === "blogpost"
-        ? await api.createBlogPost({ spaceId, title: action.title, status: action.status, storageValue })
-        : await api.createPage({
-            spaceId,
-            title: action.title,
-            status: action.status,
-            storageValue,
-            parentId: action.parent.type === "page" ? requireResolved(store, action.parent.parentId) : undefined,
-          });
+      const parentId = action.parent.type === "page" ? requireResolved(store, action.parent.parentId) : undefined;
+      const created = await writeOnce(store, record, `create ${action.kind === "blogpost" ? "the blog post" : "the page"}`,
+        action.kind === "blogpost" ? "blog post" : "page",
+        () => action.kind === "blogpost"
+          ? api.createBlogPost({ spaceId, title: action.title, status: action.status, storageValue })
+          : api.createPage({ spaceId, title: action.title, status: action.status, storageValue, parentId }));
       record.createdContentId = created.id;
       store.setProvisional(action.provisionalId, created.id);
       store.putAction(record);
@@ -666,8 +699,8 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
       const id = requireResolved(store, action.contentId);
       // The comment container type must match the target (blog posts reject a "page" container).
       const target = await store.getContentResponse(id, true);
-      const created = await api.addComment(id, markdownToStorage(action.text),
-        target.type === "blogpost" ? "blogpost" : "page");
+      const created = await writeOnce(store, record, "post the comment", "comment",
+        () => api.addComment(id, markdownToStorage(action.text), target.type === "blogpost" ? "blogpost" : "page"));
       record.createdContentId = created.id;
       store.putAction(record);
       break;
@@ -682,9 +715,9 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
       break;
     case "uploadAttachment": {
       const id = requireResolved(store, action.contentId);
-      const created = await api.uploadAttachment(id, {
-        ...action, data: await store.readAttachment(action),
-      });
+      const data = await store.readAttachment(action);
+      const created = await writeOnce(store, record, "upload the attachment", "attachment",
+        () => api.uploadAttachment(id, { ...action, data }));
       record.createdAttachmentId = created.id;
       store.putAction(record);
       break;

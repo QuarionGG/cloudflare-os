@@ -10,7 +10,7 @@ import {
   type UploadAttachmentAction,
 } from "../src/confluence-actions";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
-import type { ConfluenceApi } from "../src/confluence-api";
+import { ConfluenceApiError, type ConfluenceApi } from "../src/confluence-api";
 
 type Storage = ConstructorParameters<typeof ConfluenceStore>[0];
 
@@ -205,6 +205,41 @@ describe("applyStoredAction", () => {
 
     expect(calls.uploadAttachment).toEqual([{ id: "123", filename: "legacy.bin", data }]);
     expect(store.getAction(id)?.state).toBe("applied");
+  });
+
+  it("won't post a comment again after a post whose reply was lost", async () => {
+    const { api, calls } = makeApi();
+    const post = api.addComment.bind(api);
+    api.addComment = async (...args: Parameters<typeof api.addComment>) => {
+      await post(...args);
+      throw new TypeError("Network connection lost.");
+    };
+    const store = storeWith(api);
+    const id = stage(store, { type: "addComment", contentId: "555", text: "hi" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+    expect(calls.addComment).toHaveLength(1);
+    expect(store.getAction(id)?.state).toBe("pending");
+  });
+
+  it("posts the comment on a retry after Confluence refused the first attempt", async () => {
+    const { api, calls } = makeApi();
+    const post = api.addComment.bind(api);
+    let refuse = true;
+    api.addComment = async (...args: Parameters<typeof api.addComment>) => {
+      if (refuse) { refuse = false; throw new ConfluenceApiError(409, "Conflict"); }
+      return post(...args);
+    };
+    const store = storeWith(api);
+    const id = stage(store, { type: "addComment", contentId: "555", text: "hi" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Conflict");
+    await applyStoredAction(store, id);
+
+    expect(calls.addComment).toHaveLength(1);
+    expect(store.getAction(id)).toMatchObject({ state: "applied", createdContentId: "comment-1" });
   });
 
   it("won't append again after an append whose reply was lost moved the page on", async () => {
