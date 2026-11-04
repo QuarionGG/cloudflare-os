@@ -83,3 +83,5 @@ Totale: 123,45 EUR
 ```
 
 The tool execution output was inspected, not just the agent's summary. The test did not modify any files or apps. Proof screenshot: `/tmp/cfos-gatekeeper-live-proof.png` on the local operator machine. This verifies the Gatekeeper path in addition to the earlier independent chat-image checks for Astra, Terra and Sol.
+
+The existing Agenda & Conti gadget now retains its original `LLM` connection and has a second persisted `OCR` connection using GPT-6.1 Terra. The connection was accepted and checked after a browser reload. Its own agent re-described both gadget bindings and confirmed `LLM.run(..., images?)` and `OCR.readImages(...)`. No receipt, document, app code or app data was read or modified for that final type check. The app's receipt-intake code still needs to invoke the new interface when the user chooses to integrate it.
