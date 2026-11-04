@@ -31,6 +31,36 @@ The original active versions are:
 
 Cloudflare's latest uploaded script can differ from the active version after a pause/resume. Always resolve the version from the latest deployment; do not use the latest upload as the baseline.
 
-Build artifacts, private binding snapshots and the staged deployment/rollback script are stored locally in `/tmp/cfos-vision-deploy`, outside Git. The script accepts `stage`, `promote` and `rollback`, reads the existing Wrangler session in memory, and checks active version IDs before mutations. Never commit credential files or private snapshots.
+Build artifacts, private binding snapshots and the staged deployment/rollback script are stored locally in the gitignored `.local-vision-deploy/` directory (with temporary build copies in `/tmp/cfos-vision-deploy`). The script accepts `stage`, `promote` and `rollback`, reads the existing Wrangler session in memory, and checks active version IDs before mutations. Never commit credential files or private snapshots.
 
 Appflare's installation currently originates from the official catalog, not this source checkout. Per-app automatic updates are disabled with the owner's approval so a catalog update cannot overwrite the patch. The catalog UI can still show the official version; the custom version IDs in Cloudflare identify the actual deployment. Changing settings or manually updating from the official catalog may replace the custom build. Integrate future upstream changes into this branch, resolve conflicts, rerun verification and build before deploying again. A Git fork alone does not change Appflare's installation source or provide automatic deployment.
+
+## Fork maintenance
+
+The fork is https://github.com/QuarionGG/cloudflare-os. Its default and deployment-source branch is `vision-gatekeeper`; `upstream` points to `cloudflare/cloudflare-os`. The deployed runtime patch is in commits `3261d93d` (kernel/shared) and `016cfc37` (frontend/docs), based on `b4f706a`.
+
+Update in a review branch rather than force-syncing the production branch:
+
+```sh
+git fetch upstream
+git switch -c update/upstream-YYYY-MM-DD origin/vision-gatekeeper
+git merge upstream/main
+# Resolve conflicts; inspect API changes and Durable Object migrations.
+pnpm lint
+pnpm --filter @gadgets/workshop-backend test:run
+pnpm --filter @gadgets/workshop-frontend test:run
+# Review before merging into vision-gatekeeper and building/deploying.
+```
+
+Upstream merges can require changes even when Git reports no conflicts. Do not force-reset the customized branch to upstream. No Actions workflows, triggers or secrets were changed for this fork; no automatic deployment pipeline is configured. Appflare source-repository installations in this manager version require manual rebuild/review, and the existing catalog installation cannot be switched to a repository through its current UI. The current deployment therefore uses this fork's build on the existing resources, with Appflare catalog auto-updates off. Do not reinstall or manipulate the manager database merely to change its source label.
+
+Custom active versions, verified with all original bindings and the existing migration tag:
+
+- Backend: `30e9b328-7d6d-4a6f-9594-194cad9689c9`
+- Router: `da841272-6dd3-4a16-92a2-dc3c9ef0afc9`
+
+Local rollback, after verifying these are still the active versions:
+
+```sh
+node .local-vision-deploy/deploy.mjs rollback
+```
