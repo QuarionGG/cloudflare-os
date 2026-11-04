@@ -961,6 +961,11 @@ type StoredAction = (
    * reply was lost (see `enqueue`).
    */
   applyStarted?: true;
+  /**
+   * For createIssue / postComment / createLabel: the UUID sent to Linear as the new entity's id,
+   * stored before the create is sent (see `#createOnce`).
+   */
+  createId?: string;
 };
 
 /**
@@ -1594,10 +1599,10 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
           // Resolve any provisional `~label:` ids (labels created earlier in the batch).
           if (action.input.labelIds) action.input.labelIds = action.input.labelIds.map(id => this.#requireLabelId(id));
-          const issue = await api.createIssue(action.input);
-          action.createdIssueId = issue.id;
+          const issueId = await this.#createOnce(api, action, "issues", id => api.createIssue({ ...action.input, id }));
+          action.createdIssueId = issueId;
           this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-          this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issue.id);
+          this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issueId);
           break;
         }
         case "updateIssue": {
@@ -1625,19 +1630,20 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           break;
         }
         case "postComment": {
-          const comment = await api.createComment(this.resolveIssueRef(action.issueRef), action.body);
-          action.createdCommentId = comment.id;
+          const issueId = this.resolveIssueRef(action.issueRef);
+          action.createdCommentId =
+            await this.#createOnce(api, action, "comments", id => api.createComment(issueId, action.body, id));
           this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
           break;
         }
         case "createLabel": {
-          const label = await api.createLabel({
-            teamId: action.teamId, name: action.name, color: action.color, description: action.description,
-          });
-          action.createdLabelId = label.id;
+          const labelId = await this.#createOnce(api, action, "issueLabels", id => api.createLabel({
+            id, teamId: action.teamId, name: action.name, color: action.color, description: action.description,
+          }));
+          action.createdLabelId = labelId;
           this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
           // Map the provisional label id to the real one, so dependent addLabels can resolve it.
-          this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, label.id);
+          this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, labelId);
           // The team's real label set changed; drop the cache so the new label shows promptly.
           this.ctx.storage.kv.delete(`cache:labels:${action.teamId}`);
           break;
@@ -1653,6 +1659,26 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     action.status = "applied";
     this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
     this.#invalidatePendingActions();
+  }
+
+  // Create an action's entity under a UUID stored before the create is sent, so an apply after an
+  // attempt whose reply was lost finds the entity that attempt made instead of making a second one.
+  // A failed lookup throws and leaves the action to a later apply, never creating blind. The kernel
+  // could cover every gatekeeper by having the auto-approval drainer not re-apply an action whose
+  // automatic apply was already attempted.
+  async #createOnce(
+    api: LinearApi,
+    action: StoredAction,
+    list: "issues" | "comments" | "issueLabels",
+    create: (id: string) => Promise<{ id: string }>,
+  ): Promise<string> {
+    if (action.createId) {
+      if (await api.hasEntity(list, action.createId)) return action.createId;
+    } else {
+      action.createId = crypto.randomUUID();
+      this.ctx.storage.kv.put<StoredAction>(`action:${action.id}`, action);
+    }
+    return (await create(action.createId)).id;
   }
 
   // Recursively drop every pending action that depends on a rejected provisional issue: edits and

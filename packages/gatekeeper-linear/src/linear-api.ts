@@ -303,6 +303,8 @@ const COMMENT_FIELDS = `id body url createdAt updatedAt user { ${USER_FIELDS} }`
 
 /** Linear input types */
 export type IssueCreateInput = {
+  /** A client-chosen UUID for the new issue; Linear assigns one when absent. */
+  id?: string;
   teamId: string;
   title: string;
   description?: string;
@@ -615,6 +617,21 @@ export class LinearApi {
     return data.project;
   }
 
+  /**
+   * Whether Linear has the issue, comment or label with this UUID. A filtered list answers an
+   * absent id with no nodes, where `issue(id:)` and its siblings answer with an error.
+   */
+  async hasEntity(list: "issues" | "comments" | "issueLabels", id: string): Promise<boolean> {
+    const filterType = { issues: "IssueFilter", comments: "CommentFilter", issueLabels: "IssueLabelFilter" }[list];
+    const data = await this.graphql<Record<string, RawConnection<{ id: string }>>>(
+      `query($filter: ${filterType}) {
+        ${list}(first: 1, filter: $filter, includeArchived: true) { nodes { id } pageInfo { hasNextPage endCursor } }
+      }`,
+      { filter: { id: { eq: id } } },
+    );
+    return data[list].nodes.length > 0;
+  }
+
   // ---- Mutations ----------------------------------------------------------
 
   async createIssue(input: IssueCreateInput): Promise<RawIssue> {
@@ -647,12 +664,12 @@ export class LinearApi {
     }
   }
 
-  async createComment(issueId: string, body: string): Promise<RawComment> {
+  async createComment(issueId: string, body: string, id?: string): Promise<RawComment> {
     const data = await this.graphql<{ commentCreate: { success: boolean; comment: RawComment } }>(
       `mutation($input: CommentCreateInput!) {
         commentCreate(input: $input) { success comment { ${COMMENT_FIELDS} } }
       }`,
-      { input: { issueId, body } },
+      { input: { id, issueId, body } },
     );
     if (!data.commentCreate.success) throw new LinearApiError(400, "Linear refused to create the comment.");
     return data.commentCreate.comment;
@@ -665,7 +682,9 @@ export class LinearApi {
     );
   }
 
-  async createLabel(input: { teamId: string; name: string; color?: string; description?: string }): Promise<RawLabel> {
+  async createLabel(
+    input: { id?: string; teamId: string; name: string; color?: string; description?: string },
+  ): Promise<RawLabel> {
     const data = await this.graphql<{ issueLabelCreate: { success: boolean; issueLabel: RawLabel } }>(
       `mutation($input: IssueLabelCreateInput!) {
         issueLabelCreate(input: $input) { success issueLabel { ${LABEL_FIELDS} } }
