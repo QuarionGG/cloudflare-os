@@ -10,6 +10,7 @@
 
 import {
   NotionApi,
+  NotionApiError,
   blocksToMarkdown,
   iconInputToNotion,
   markdownToBlocks,
@@ -96,6 +97,12 @@ export type StoredActionRecord = {
    * reply was lost (see stageAction).
    */
   applyStartedAt?: number;
+  /**
+   * For appendContent / addComment / createPage: when the write was sent to Notion, recorded
+   * before sending and cleared if Notion refused it, so a later apply can tell an earlier attempt
+   * may have gone through (see writeOnce).
+   */
+  writeDispatchedAt?: number;
   /** For appendContent revert: the IDs of the blocks created on apply. */
   appendedBlockIds?: string[];
   /** For createPage: the real Notion page ID assigned on apply. */
@@ -876,7 +883,8 @@ export async function applyNotionAction(store: NotionStore, record: StoredAction
   switch (action.type) {
     case "appendContent": {
       const pageId = requireResolved(store, action.pageId);
-      const ids = await api.appendBlockChildren(pageId, markdownToBlocks(action.markdown));
+      const ids = await writeOnce(store, record, "append to the page", "text",
+        () => api.appendBlockChildren(pageId, markdownToBlocks(action.markdown)));
       record.appendedBlockIds = ids;
       // Persist the revert info immediately so a crash before the end of this function can't lose
       // the IDs of the blocks we just created (which we need to revert the append).
@@ -916,14 +924,15 @@ export async function applyNotionAction(store: NotionStore, record: StoredAction
     }
     case "addComment": {
       const pageId = requireResolved(store, action.pageId);
-      await api.createComment({ parent: { page_id: pageId }, rich_text: plainToRichText(action.text) });
+      await writeOnce(store, record, "post the comment", "comment",
+        () => api.createComment({ parent: { page_id: pageId }, rich_text: plainToRichText(action.text) }));
       break;
     }
     case "createPage": {
       const parent = await resolveCreateParent(store, action.parent);
       const body = buildCreateBody(
         parent, action.title, action.properties, action.content, action.icon, action.titlePropertyName);
-      const page = await api.createPage(body);
+      const page = await writeOnce(store, record, "create the page", "page", () => api.createPage(body));
       record.createdPageId = page.id;
       // Persist the real ID immediately — a crash before the end of this function would otherwise
       // orphan the just-created Notion page (no record of it to revert).
@@ -935,6 +944,39 @@ export async function applyNotionAction(store: NotionStore, record: StoredAction
 
   record.state = "applied";
   store.putAction(record);
+}
+
+/**
+ * Sends `write`, which Notion would repeat if sent twice, at most once per action: an attempt
+ * whose outcome is unknown (its reply lost, or the DO restarted) fences off every later one, and
+ * only a refusal from Notion lets a retry send it again.
+ */
+async function writeOnce<T>(
+  store: NotionStore,
+  record: StoredActionRecord,
+  attempt: string,
+  result: string,
+  write: () => Promise<T>,
+): Promise<T> {
+  // The auto-approval drainer not re-applying an action whose automatic apply was already
+  // attempted would cover this for every gatekeeper, so this fence could move into the kernel.
+  if (record.writeDispatchedAt !== undefined) {
+    throw new Error(
+      `An earlier attempt to ${attempt} may have gone through, so it won't be tried again. Check ` +
+      `the page and discard this action; if the ${result} is missing, ask for it again.`);
+  }
+  record.writeDispatchedAt = Date.now();
+  store.putAction(record);
+  try {
+    return await write();
+  } catch (err) {
+    // A 4xx means Notion refused the write; a 5xx can come after it took effect.
+    if (err instanceof NotionApiError && err.status < 500) {
+      record.writeDispatchedAt = undefined;
+      store.putAction(record);
+    }
+    throw err;
+  }
 }
 
 /** Revert a previously-applied action. Returns guidance if the revert can't fully complete. */

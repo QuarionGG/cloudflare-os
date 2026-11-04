@@ -8,6 +8,7 @@ import {
   stageAction,
   type NotionAction,
 } from "../src/notion-actions";
+import { NotionApiError } from "../src/notion-api";
 
 const databaseRow = (titlePropertyName?: string) => describeAction({
   type: "createPage",
@@ -198,21 +199,24 @@ describe("findWorkspaceParentPage", () => {
   });
 });
 
+function storeWith(api: object) {
+  const kv = new Map<string, unknown>();
+  const storage = {
+    get: (key: string) => structuredClone(kv.get(key)),
+    put: (key: string, value: unknown) => void kv.set(key, structuredClone(value)),
+    delete: (key: string) => kv.delete(key),
+    list: ({ prefix }: { prefix: string }) => [...kv].filter(([key]) => key.startsWith(prefix)),
+  };
+  return new NotionStore(storage as never, api as never);
+}
+
 describe("stageAction", () => {
   function memoryStore(appended: string[], failApply = false) {
-    const kv = new Map<string, unknown>();
-    const storage = {
-      get: (key: string) => structuredClone(kv.get(key)),
-      put: (key: string, value: unknown) => void kv.set(key, structuredClone(value)),
-      delete: (key: string) => kv.delete(key),
-      list: ({ prefix }: { prefix: string }) => [...kv].filter(([key]) => key.startsWith(prefix)),
-    };
-    const api = { appendBlockChildren: async (pageId: string) => {
+    return storeWith({ appendBlockChildren: async (pageId: string) => {
       if (failApply) throw new Error("Notion is unavailable");
       appended.push(pageId);
       return ["block-1"];
-    } };
-    return new NotionStore(storage as never, api as never);
+    } });
   }
 
   it("keeps an action applied before a lost submit reply, and reports it submitted", async () => {
@@ -262,5 +266,78 @@ describe("stageAction", () => {
     await expect(stageAction(store, queue as never, { type: "appendContent", pageId: "page-1", markdown: "Hello" }))
       .rejects.toThrow("queue gone");
     expect(store.getAction(1)).toBeUndefined();
+  });
+});
+
+describe("applyStoredAction", () => {
+  // Fails the first call with `error`, after carrying out the write when `landed`.
+  function failingOnce<T>(error: Error, landed: boolean, write: () => T) {
+    let failed = false;
+    return async () => {
+      if (failed) return write();
+      failed = true;
+      if (landed) write();
+      throw error;
+    };
+  }
+
+  function stage(store: NotionStore, action: NotionAction): number {
+    const id = store.nextActionId();
+    store.putAction({ id, action, state: "pending", submittedAt: Date.now() });
+    return id;
+  }
+
+  it("won't append again after an append whose reply was lost", async () => {
+    const appended: string[] = [];
+    const store = storeWith({ appendBlockChildren: failingOnce(
+      new TypeError("Network connection lost."), true, () => { appended.push("Hello"); return ["block-1"]; }) });
+    const id = stage(store, { type: "appendContent", pageId: "page-1", markdown: "Hello" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+    expect(appended).toEqual(["Hello"]);
+    expect(store.getAction(id)?.state).toBe("pending");
+  });
+
+  it("appends on a retry after Notion refused the first attempt", async () => {
+    const appended: string[] = [];
+    const store = storeWith({ appendBlockChildren: failingOnce(
+      new NotionApiError(409, "Conflict"), false, () => { appended.push("Hello"); return ["block-1"]; }) });
+    const id = stage(store, { type: "appendContent", pageId: "page-1", markdown: "Hello" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Conflict");
+    await applyStoredAction(store, id);
+
+    expect(appended).toEqual(["Hello"]);
+    expect(store.getAction(id)).toMatchObject({ state: "applied", appendedBlockIds: ["block-1"] });
+  });
+
+  it("won't post a comment again after a post whose reply was lost", async () => {
+    const comments: string[] = [];
+    const store = storeWith({ createComment: failingOnce(
+      new TypeError("Network connection lost."), true, () => void comments.push("Hi")) });
+    const id = stage(store, { type: "addComment", pageId: "page-1", text: "Hi" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+    expect(comments).toEqual(["Hi"]);
+    expect(store.getAction(id)?.state).toBe("pending");
+  });
+
+  it("won't create a page again after a create whose reply was lost", async () => {
+    const created: string[] = [];
+    const store = storeWith({ createPage: failingOnce(
+      new TypeError("Network connection lost."), true, () => { created.push("New"); return { id: "page-1" }; }) });
+    const id = stage(store, {
+      type: "createPage", provisionalId: "~1", parent: { kind: "page", pageId: "parent-1" }, title: "New",
+    });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("Network connection lost.");
+    await expect(applyStoredAction(store, id)).rejects.toThrow(/may have gone through/);
+
+    expect(created).toEqual(["New"]);
+    expect(store.getAction(id)?.state).toBe("pending");
   });
 });
